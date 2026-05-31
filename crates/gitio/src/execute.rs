@@ -7,10 +7,11 @@
 //! 4. Apply only on successful rehearsal.
 //! 5. RAII cleanup of worktrees.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gunk_core::{RebaseTodo, RebaseTodoLine};
+use gunk_core::{CommitId, RebaseTodo, RebaseTodoLine};
 use thiserror::Error;
 
 use crate::git::{Git, GitError};
@@ -320,12 +321,99 @@ pub fn execute_rebase(
     }
 }
 
+/// Build the rebase todo text with message feeding via `exec` lines.
+///
+/// When a `Reword` line has a corresponding message in `message_map`, it is
+/// converted to a `Pick` followed by `exec git commit --amend -F <path>`.
+/// This avoids needing a custom `GIT_EDITOR` for message feeding.
+///
+/// Returns `(todo_text, message_files)` where `message_files` contains
+/// `(path, content)` pairs that must be written to disk before the rebase.
+fn build_rebase_text(
+    todo: &RebaseTodo,
+    msg_dir: &std::path::Path,
+) -> (String, Vec<(PathBuf, String)>) {
+    let msg_lookup: HashMap<&CommitId, &str> = todo
+        .message_map
+        .iter()
+        .map(|(id, msg)| (id, msg.as_str()))
+        .collect();
+
+    let mut output_lines: Vec<String> = Vec::new();
+    let mut msg_files: Vec<(PathBuf, String)> = Vec::new();
+    let mut pending_msg: Option<&str> = None;
+
+    for line in &todo.lines {
+        // Group-continuation lines (squash/fixup/exec) do not trigger a flush
+        // of the pending message exec. Boundary lines (pick/reword/drop) do.
+        let is_group_continuation = matches!(
+            line,
+            RebaseTodoLine::Squash(_) | RebaseTodoLine::Fixup(_) | RebaseTodoLine::Exec(_)
+        );
+
+        if !is_group_continuation {
+            flush_pending_message(&mut pending_msg, &mut output_lines, &mut msg_files, msg_dir);
+        }
+
+        match line {
+            RebaseTodoLine::Reword(id) => {
+                if let Some(&msg) = msg_lookup.get(id) {
+                    // Convert reword → pick; the message is fed via exec.
+                    output_lines.push(format!("pick {}", id.0));
+                    pending_msg = Some(msg);
+                } else {
+                    output_lines.push(format!("reword {}", id.0));
+                }
+            }
+            RebaseTodoLine::Pick(id) => output_lines.push(format!("pick {}", id.0)),
+            RebaseTodoLine::Squash(id) => output_lines.push(format!("squash {}", id.0)),
+            RebaseTodoLine::Fixup(id) => output_lines.push(format!("fixup {}", id.0)),
+            RebaseTodoLine::Drop(id) => output_lines.push(format!("drop {}", id.0)),
+            RebaseTodoLine::Exec(cmd) => output_lines.push(format!("exec {cmd}")),
+        }
+    }
+
+    // Flush any trailing pending message.
+    flush_pending_message(&mut pending_msg, &mut output_lines, &mut msg_files, msg_dir);
+
+    (output_lines.join("\n") + "\n", msg_files)
+}
+
+/// If there is a pending message, emit an `exec git commit --amend -F <path>`
+/// line and record the file to be written.
+///
+/// Uses a relative filename (`.gunk-msg-N.txt`) so the exec line is immune to
+/// special characters in the repository's absolute path.
+fn flush_pending_message(
+    pending: &mut Option<&str>,
+    output_lines: &mut Vec<String>,
+    msg_files: &mut Vec<(PathBuf, String)>,
+    msg_dir: &std::path::Path,
+) {
+    if let Some(msg) = pending.take() {
+        let idx = msg_files.len();
+        // Relative filename — no special-character issues in exec lines.
+        let file_name = format!(".gunk-msg-{idx}.txt");
+        let file_path = msg_dir.join(&file_name);
+        output_lines.push(format!("exec git commit --amend -F '{file_name}'"));
+        msg_files.push((file_path, msg.to_string()));
+    }
+}
+
 /// Run a non-interactive rebase inside a git worktree using GIT_SEQUENCE_EDITOR.
 ///
 /// Cross-platform: writes a small helper script that copies our prepared todo
 /// over the file git passes as $1 / %1.
 fn run_rebase_in(git: &Git, todo: &RebaseTodo) -> Result<String, ExecuteError> {
-    let todo_content = format_rebase_todo(todo);
+    // Build the todo text with message feeding via exec lines.
+    let (todo_content, msg_files) = build_rebase_text(todo, git.repo_path());
+
+    // Write message files to disk.
+    for (path, content) in &msg_files {
+        std::fs::write(path, content).map_err(|e| {
+            ExecuteError::RehearsalFailed(format!("failed to write message file: {e}"))
+        })?;
+    }
 
     // Write todo to a temp file in the worktree.
     let todo_path = git.repo_path().join(".gunk-rebase-todo");
@@ -342,9 +430,8 @@ fn run_rebase_in(git: &Git, todo: &RebaseTodo) -> Result<String, ExecuteError> {
     // This is the cross-platform "sequence editor" approach from the plan.
     let (script_path, seq_editor) = create_seq_editor_script(git.repo_path(), &todo_path)?;
 
-    // Message editor: `true` (no-op) keeps default combined message for squash.
-    // Phase 5 will implement proper message feeding via a subcommand.
-    // Git for Windows also uses bash internally, so `true` works everywhere.
+    // Message editor: `true` (no-op). Actual message changes are handled via
+    // `exec git commit --amend -F <path>` lines in the todo.
     let msg_editor = "true";
 
     // Run the rebase.
@@ -361,6 +448,9 @@ fn run_rebase_in(git: &Git, todo: &RebaseTodo) -> Result<String, ExecuteError> {
     // Clean up temp files.
     let _ = std::fs::remove_file(&todo_path);
     let _ = std::fs::remove_file(&script_path);
+    for (path, _) in &msg_files {
+        let _ = std::fs::remove_file(path);
+    }
 
     if !result.status.success() {
         let stderr = String::from_utf8_lossy(&result.stderr);
