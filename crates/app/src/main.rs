@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use eframe::egui;
 use gunk_core::{
-    ChangeStatus, Commit, CommitId, DraftMsg, DraftState, Identity, PathChange, PathSpec,
-    PreviewRow, RowStatus, SearchHit, SelectionMsg, SelectionState, plan, preview, search_commits,
-    search_hit_indices,
+    ChangeStatus, CoAuthor, Commit, CommitId, DraftMsg, DraftState, Identity, PathChange, PathSpec,
+    PreviewRow, RowStatus, SearchHit, SelectionMsg, SelectionState, parse_co_authors, plan,
+    preview, search_commits, search_hit_indices,
 };
 use gunk_gitio::{
     BranchInfo, ExecuteResult, Git, execute_plan as gitio_execute_plan, has_filter_repo,
@@ -64,6 +64,9 @@ struct RepoState {
     author_name: String,
     /// Edit buffer for the author email (set-author).
     author_email: String,
+    /// Edit buffers for co-author management.
+    co_author_name: String,
+    co_author_email: String,
     /// Whether the confirmation dialog is visible.
     show_confirm_dialog: bool,
     /// Result of the last plan execution (success or error message).
@@ -271,6 +274,8 @@ impl App {
                     reword_body: String::new(),
                     author_name: String::new(),
                     author_email: String::new(),
+                    co_author_name: String::new(),
+                    co_author_email: String::new(),
                     show_confirm_dialog: false,
                     execute_result: None,
                     show_restore_panel: false,
@@ -596,6 +601,8 @@ impl App {
         repo.reword_body.clear();
         repo.author_name.clear();
         repo.author_email.clear();
+        repo.co_author_name.clear();
+        repo.co_author_email.clear();
         repo.files_selected_for_removal.clear();
         repo.add_to_gitignore = false;
         match read_commit_window(&repo.git, &branch, repo.commits.len()) {
@@ -877,6 +884,64 @@ impl eframe::App for App {
                                 });
                             }
                         });
+                        let existing_co_authors =
+                            parse_co_authors(&repo.commits[idx].body);
+                        ui.collapsing("Co-authors", |ui| {
+                            if existing_co_authors.is_empty() {
+                                ui.label("No co-authors");
+                            } else {
+                                for (i, ca) in
+                                    existing_co_authors.iter().enumerate()
+                                {
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!(
+                                            "{} <{}>",
+                                            ca.name, ca.email
+                                        ));
+                                        if ui.small_button("✕").clicked() {
+                                            let mut updated =
+                                                existing_co_authors.clone();
+                                            updated.remove(i);
+                                            draft_msg =
+                                                Some(DraftMsg::SetCoAuthors {
+                                                    targets: vec![id.clone()],
+                                                    co_authors: updated,
+                                                });
+                                        }
+                                    });
+                                }
+                            }
+                            ui.separator();
+                            ui.label("Add co-author");
+                            ui.label("Name");
+                            ui.text_edit_singleline(&mut repo.co_author_name);
+                            ui.label("Email");
+                            ui.text_edit_singleline(&mut repo.co_author_email);
+                            if ui.button("Add co-author").clicked()
+                                && !repo.co_author_name.trim().is_empty()
+                                && !repo.co_author_email.trim().is_empty()
+                            {
+                                let mut updated = existing_co_authors.clone();
+                                updated.push(CoAuthor {
+                                    name: repo.co_author_name.clone(),
+                                    email: repo.co_author_email.clone(),
+                                });
+                                draft_msg = Some(DraftMsg::SetCoAuthors {
+                                    targets: vec![id.clone()],
+                                    co_authors: updated,
+                                });
+                                repo.co_author_name.clear();
+                                repo.co_author_email.clear();
+                            }
+                            if !existing_co_authors.is_empty()
+                                && ui.button("Remove all co-authors").clicked()
+                            {
+                                draft_msg = Some(DraftMsg::SetCoAuthors {
+                                    targets: vec![id.clone()],
+                                    co_authors: vec![],
+                                });
+                            }
+                        });
                         ui.separator();
 
                         let commit = &repo.commits[idx];
@@ -1010,6 +1075,35 @@ impl eframe::App for App {
                                         email: repo.author_email.clone(),
                                         time: time::OffsetDateTime::now_utc(),
                                     },
+                                });
+                            }
+                        });
+                        ui.collapsing("Set co-authors (all)", |ui| {
+                            ui.label("Name");
+                            ui.text_edit_singleline(&mut repo.co_author_name);
+                            ui.label("Email");
+                            ui.text_edit_singleline(&mut repo.co_author_email);
+                            if ui.button("Add co-author to all").clicked()
+                                && !repo.co_author_name.trim().is_empty()
+                                && !repo.co_author_email.trim().is_empty()
+                            {
+                                draft_msg = Some(DraftMsg::SetCoAuthors {
+                                    targets: targets.clone(),
+                                    co_authors: vec![CoAuthor {
+                                        name: repo.co_author_name.clone(),
+                                        email: repo.co_author_email.clone(),
+                                    }],
+                                });
+                                repo.co_author_name.clear();
+                                repo.co_author_email.clear();
+                            }
+                            if ui
+                                .button("Remove all co-authors from all")
+                                .clicked()
+                            {
+                                draft_msg = Some(DraftMsg::SetCoAuthors {
+                                    targets: targets.clone(),
+                                    co_authors: vec![],
                                 });
                             }
                         });
