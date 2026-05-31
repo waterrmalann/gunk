@@ -40,6 +40,18 @@ This eliminates the class of bugs where Windows path separators or cmd.exe quoti
 - On any failure during rehearsal, the worktree rebase is aborted (`rebase --abort`) and the guard cleans up.
 - The caller receives a clear error and the guarantee that the real branch is untouched.
 
+### Async Execution on Worker Thread
+To prevent UI stalls on large repositories, the app runs `execute_plan` on a
+background worker thread (mirroring the async pattern used for repo-open and
+branch-switch in ADR-0022). The UI thread:
+1. Calls `plan()` synchronously (pure, fast) to validate and surface errors inline.
+2. Moves the `ExecutionPlan`, cloned `Git`, and branch name to a `thread::spawn`.
+3. Polls via `mpsc` channel; disables mutation controls and shows a spinner while executing.
+4. On completion, swaps the commit list, resets draft state, and displays the result.
+
+The safety protocol itself is unchanged — dirty-tree refusal, backup refs, worktree
+rehearsal, and RAII cleanup all run identically on the worker thread.
+
 ## Consequences
 - The execution engine is integration-tested against real throwaway repos (18 tests).
 - All rebase-class operations (drop, squash, fixup, reorder) go through the same safety envelope.

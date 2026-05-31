@@ -18,15 +18,17 @@ Phase 6 adds the ability to remove files from repository history. This is implem
 - This puts filter-repo in "partial" mode, which **skips garbage collection** and **leaves other refs untouched**.
 - This is critical because our backup refs at `refs/gunk/backup/<branch>/<timestamp>` must survive the rewrite — they point at the pre-rewrite commit objects, which must remain in the object database for restore.
 
-### 3. No worktree rehearsal for filter-repo
-- Unlike `execute_rebase` (which uses a throwaway worktree), `execute_filter_repo` runs directly on the repository.
-- Rationale: filter-repo is atomic — it either succeeds completely or fails without partial writes. The backup ref + restore pattern provides equivalent safety.
-- If filter-repo fails, the error path calls `restore_backup()` to reset the branch.
+### 3. Clone-based rehearsal for filter-repo
+- Unlike `execute_rebase` (which uses a throwaway worktree), `execute_filter_repo` rehearses in an **isolated `--no-hardlinks --single-branch` clone** of the repository.
+- Rationale: filter-repo rewrites the shared object store and refs by name, so a worktree (which shares these) cannot provide isolation. A full clone gives a hermetic sandbox.
+- On success, the rewritten tip is fetched back into the real repo; the branch ref and working tree are updated.
+- On failure, the clone is discarded and the real repo is untouched.
+- The clone's `.git/filter-repo/commit-map` is parsed to build the OID mapping for composite plan retargeting (see ADR-0024).
 
-### 4. Composite plan OID invalidation
+### 4. Composite plan OID retargeting
 - When a user combines RemovePaths with rebase operations, the plan engine produces `Composite([FilterRepo, Rebase])`.
 - Filter-repo rewrites all commit OIDs. The rebase todo, computed against the original snapshot, references stale OIDs.
-- **Solution**: The app layer splits filter-repo and rebase operations, executes filter-repo first, re-snapshots (`walk_commits`), re-plans the rebase operations against the fresh snapshot, then executes the rebase. This avoids the stale OID problem entirely.
+- **Solution**: `execute_composite` threads an accumulated `OidMap` through phases — each sub-plan is retargeted via `ExecutionPlan::remap_oids()` before execution, and the result's OID map is composed into the accumulator (see ADR-0024). The app layer no longer re-snapshots or re-plans between phases.
 
 ### 5. Gitignore integration
 - When `add_to_gitignore` is true, removed paths are appended to `.gitignore` with a comment header, then staged and committed.
@@ -40,4 +42,4 @@ Phase 6 adds the ability to remove files from repository history. This is implem
 - File removal from history requires `git-filter-repo` (Python) to be installed.
 - The `--refs` scoping means only the target branch is rewritten; other branches retain the removed files.
 - Backup refs survive filter-repo and can be used for restore.
-- Mixed operations (file removal + rebase) work correctly via the re-snapshot pipeline.
+- Mixed operations (file removal + rebase) work correctly via the OID remap pipeline (ADR-0024).
