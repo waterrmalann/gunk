@@ -435,7 +435,7 @@ fn run_rebase_in(git: &Git, todo: &RebaseTodo) -> Result<String, ExecuteError> {
     let msg_editor = "true";
 
     // Run the rebase.
-    let result = std::process::Command::new("git")
+    let result = std::process::Command::new(git.git_binary())
         .args(["rebase", "-i", &base_arg])
         .current_dir(git.repo_path())
         .env("GIT_TERMINAL_PROMPT", "0")

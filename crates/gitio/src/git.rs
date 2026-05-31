@@ -80,6 +80,11 @@ impl Git {
         &self.repo_path
     }
 
+    /// Returns the path to the `git` binary used for all invocations.
+    pub fn git_binary(&self) -> &Path {
+        &self.git_binary
+    }
+
     /// Run a git command with the given arguments, returning stdout/stderr.
     pub fn run<I, S>(&self, args: I) -> Result<GitOutput, GitError>
     where
