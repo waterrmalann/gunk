@@ -270,7 +270,11 @@ fn parse_iso8601(s: &str) -> Result<OffsetDateTime, GitError> {
 fn parse_commit_log(raw: &str) -> Result<Vec<Commit>, GitError> {
     let mut commits = Vec::new();
     for record in raw.split('\x01') {
-        let record = record.trim();
+        // `git log --pretty=format:` joins entries with a single `\n`, so every
+        // record after the first carries one leading newline. Strip only that
+        // leading separator — never the trailing end, which belongs to `%b` and
+        // must be preserved so reword/flatten reproduce the body faithfully.
+        let record = record.strip_prefix('\n').unwrap_or(record);
         if record.is_empty() {
             continue;
         }
@@ -309,7 +313,7 @@ fn parse_commit_log(raw: &str) -> Result<Vec<Commit>, GitError> {
                 time: committer_time,
             },
             summary: fields[8].to_string(),
-            body: fields[9].trim().to_string(),
+            body: fields[9].to_string(),
             changed_paths: Vec::new(),
         });
     }
@@ -343,11 +347,15 @@ fn parse_name_status_z(raw: &str) -> Result<Vec<PathChange>, GitError> {
             Some('T') => ChangeStatus::TypeChange,
             _ => ChangeStatus::Unknown,
         };
-        // For rename/copy, there's an extra path (old path) — skip it
-        if matches!(status, ChangeStatus::Renamed | ChangeStatus::Copied) && i + 2 < parts.len() {
+        // Rename/copy records carry an extra field: `R<score>\0<old>\0<new>`.
+        // `path` (parts[i+1]) is the OLD path; the destination is parts[i+2].
+        if matches!(status, ChangeStatus::Renamed | ChangeStatus::Copied) {
+            // Truncated record (no destination path) — stop rather than
+            // mis-recording the old path as the change.
+            let Some(dest) = parts.get(i + 2) else { break };
             changes.push(PathChange {
                 status,
-                path: parts[i + 2].to_string(),
+                path: dest.to_string(),
             });
             i += 3;
         } else {

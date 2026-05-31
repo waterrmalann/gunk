@@ -82,13 +82,26 @@ impl CoAuthor {
     }
 }
 
-/// Parse all `Co-authored-by:` trailers from a commit body.
+/// The trailer key, matched case-insensitively per Git's trailer conventions.
+const CO_AUTHOR_KEY: &str = "co-authored-by:";
+
+/// If `line` begins with the (case-insensitive) `Co-authored-by:` key, return
+/// the trimmed trailer value.
+fn co_author_value(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    if trimmed.len() < CO_AUTHOR_KEY.len() {
+        return None;
+    }
+    let (head, rest) = trimmed.split_at(CO_AUTHOR_KEY.len());
+    head.eq_ignore_ascii_case(CO_AUTHOR_KEY)
+        .then(|| rest.trim())
+}
+
+/// Parse all `Co-authored-by:` trailers from a commit body (case-insensitive).
 pub fn parse_co_authors(body: &str) -> Vec<CoAuthor> {
     let mut result = Vec::new();
     for line in body.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("Co-authored-by:") {
-            let rest = rest.trim();
+        if let Some(rest) = co_author_value(line) {
             if let Some((name, email)) = parse_trailer_identity(rest) {
                 result.push(CoAuthor { name, email });
             }
@@ -101,12 +114,7 @@ pub fn parse_co_authors(body: &str) -> Vec<CoAuthor> {
 pub fn strip_co_author_trailers(body: &str) -> String {
     let lines: Vec<&str> = body
         .lines()
-        .filter(|line| {
-            !line
-                .trim()
-                .to_ascii_lowercase()
-                .starts_with("co-authored-by:")
-        })
+        .filter(|line| co_author_value(line).is_none())
         .collect();
     lines.join("\n").trim_end().to_string()
 }
