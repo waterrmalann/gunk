@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gunk_core::{CommitId, FilterRepoSpec, RebaseTodo, RebaseTodoLine};
+use gunk_core::{CommitId, FilterRepoSpec, FlattenSpec, RebaseTodo, RebaseTodoLine};
 use thiserror::Error;
 
 use crate::git::{Git, GitError};
@@ -504,6 +504,148 @@ fn create_seq_editor_script(
     Ok((script_path, editor_cmd))
 }
 
+// ── Flatten execution ──────────────────────────────────────────────
+
+/// Execute a flatten plan against a branch.
+///
+/// This replaces a merge commit with a single ordinary commit that:
+/// - Has the exact same tree as the merge commit (byte-identical result).
+/// - Has a single parent (the mainline parent).
+///
+/// Then rebases all descendants of the merge onto the new commit.
+///
+/// Follows the same safety protocol: dirty-tree check, backup ref,
+/// worktree rehearsal, apply-on-success.
+pub fn execute_flatten(
+    git: &Git,
+    branch: &str,
+    spec: &FlattenSpec,
+) -> Result<ExecuteResult, ExecuteError> {
+    // 1. Dirty tree check.
+    check_clean(git)?;
+
+    // 2. Backup ref.
+    let backup_ref = create_backup_ref(git, branch)?;
+
+    // 3. Rehearse in a worktree.
+    let worktree_path = git.repo_path().join(".gunk-rehearsal");
+    if worktree_path.exists() {
+        let _ = git.run([
+            "worktree",
+            "remove",
+            "--force",
+            worktree_path.to_str().unwrap_or(""),
+        ]);
+        if worktree_path.exists() {
+            let _ = std::fs::remove_dir_all(&worktree_path);
+        }
+    }
+
+    let mut guard = WorktreeGuard::new(git, worktree_path, branch)?;
+    let wt_git = guard.git();
+
+    let flatten_result = run_flatten_in(&wt_git, spec, branch);
+
+    match flatten_result {
+        Ok(new_tip) => {
+            guard.remove()?;
+            git.run(["update-ref", &format!("refs/heads/{branch}"), &new_tip])?;
+
+            // If we're on this branch, reset working tree.
+            let current = git
+                .run(["symbolic-ref", "--short", "HEAD"])
+                .ok()
+                .map(|o| o.stdout.trim().to_string());
+            if current.as_deref() == Some(branch) {
+                git.run(["reset", "--hard", &new_tip])?;
+            }
+
+            let pushed_commits = check_pushed_commits(git, &[&spec.merge.0]).unwrap_or_default();
+
+            Ok(ExecuteResult {
+                backup_ref,
+                new_tip,
+                branch: branch.to_string(),
+                pushed_commits,
+            })
+        }
+        Err(e) => {
+            guard.remove()?;
+            Err(e)
+        }
+    }
+}
+
+/// Run the flatten operation inside a worktree.
+///
+/// 1. Get the merge commit's tree.
+/// 2. Create a new ordinary commit with that tree, parented on mainline.
+/// 3. Rebase all descendants onto the new commit.
+fn run_flatten_in(git: &Git, spec: &FlattenSpec, _branch: &str) -> Result<String, ExecuteError> {
+    // Get the merge commit's tree (T = M^{tree}).
+    let tree = git
+        .run(["rev-parse", &format!("{}^{{tree}}", spec.merge.0)])?
+        .stdout
+        .trim()
+        .to_string();
+
+    // Create a new commit reusing the merge tree, parented on mainline:
+    // git commit-tree T -p P1 -m "<message>" → M'
+    let new_commit = git
+        .run([
+            "commit-tree",
+            &tree,
+            "-p",
+            &spec.mainline_parent.0,
+            "-m",
+            &spec.message,
+        ])?
+        .stdout
+        .trim()
+        .to_string();
+
+    // Check if the merge is the branch tip — if so, just point HEAD at M'.
+    let branch_tip = git.run(["rev-parse", "HEAD"])?.stdout.trim().to_string();
+
+    if branch_tip == spec.merge.0 {
+        // The merge is the tip; no descendants to rebase.
+        git.run(["checkout", &new_commit])?;
+        return Ok(new_commit);
+    }
+
+    // Rebase everything after the merge onto M'.
+    // Use HEAD (detached) rather than the branch name, since the branch
+    // is checked out in the original worktree.
+    let result = std::process::Command::new(git.git_binary())
+        .args(["rebase", "--onto", &new_commit, &spec.merge.0, "HEAD"])
+        .current_dir(git.repo_path())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        .output()
+        .map_err(|e| ExecuteError::Git(GitError::Spawn(e)))?;
+
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        let combined = format!("{stdout}\n{stderr}");
+
+        // Abort any in-progress rebase.
+        let _ = std::process::Command::new(git.git_binary())
+            .args(["rebase", "--abort"])
+            .current_dir(git.repo_path())
+            .output();
+
+        if combined.contains("CONFLICT") || combined.contains("could not apply") {
+            return Err(ExecuteError::RebaseConflict(combined.trim().to_string()));
+        }
+        return Err(ExecuteError::RehearsalFailed(combined.trim().to_string()));
+    }
+
+    // Get the new tip.
+    let new_tip = git.run(["rev-parse", "HEAD"])?.stdout.trim().to_string();
+    Ok(new_tip)
+}
+
 // ── git-filter-repo detection ──────────────────────────────────────
 
 /// Check whether `git-filter-repo` is available.
@@ -668,9 +810,7 @@ pub fn execute_plan(
     match exec_plan {
         gunk_core::ExecutionPlan::Rebase(todo) => execute_rebase(git, branch, todo),
         gunk_core::ExecutionPlan::FilterRepo(spec) => execute_filter_repo(git, branch, spec),
-        gunk_core::ExecutionPlan::Flatten(_) => Err(ExecuteError::Unsupported(
-            "Flatten plans are not yet supported (Phase 7)".into(),
-        )),
+        gunk_core::ExecutionPlan::Flatten(spec) => execute_flatten(git, branch, spec),
         gunk_core::ExecutionPlan::Composite(plans) => execute_composite(git, branch, plans),
     }
 }
@@ -700,9 +840,7 @@ fn execute_composite(
         let sub_result = match sub_plan {
             gunk_core::ExecutionPlan::Rebase(todo) => execute_rebase(git, branch, todo),
             gunk_core::ExecutionPlan::FilterRepo(spec) => execute_filter_repo(git, branch, spec),
-            gunk_core::ExecutionPlan::Flatten(_) => Err(ExecuteError::Unsupported(
-                "Flatten not yet supported".into(),
-            )),
+            gunk_core::ExecutionPlan::Flatten(spec) => execute_flatten(git, branch, spec),
             gunk_core::ExecutionPlan::Composite(inner) => execute_composite(git, branch, inner),
         };
 

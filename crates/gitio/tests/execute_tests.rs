@@ -1,10 +1,11 @@
 use gunk_core::{
-    CommitId, ExecutionPlan, FilterRepoSpec, Identity, Operation, PathSpec, RebaseTodo,
-    RebaseTodoLine, plan,
+    CommitId, ExecutionPlan, FilterRepoSpec, FlattenSpec, Identity, Operation, PathSpec,
+    RebaseTodo, RebaseTodoLine, plan,
 };
 use gunk_gitio::{
-    Git, check_clean, create_backup_ref, execute_filter_repo, execute_plan, execute_rebase,
-    format_rebase_todo, has_filter_repo, list_backup_refs, restore_backup, stash_pop, stash_push,
+    Git, check_clean, create_backup_ref, execute_filter_repo, execute_flatten, execute_plan,
+    execute_rebase, format_rebase_todo, has_filter_repo, list_backup_refs, restore_backup,
+    stash_pop, stash_push,
 };
 use gunk_testkit::RepoFixture;
 use time::OffsetDateTime;
@@ -1642,4 +1643,489 @@ fn filter_repo_removes_multiple_paths() {
     assert!(!fixture.path().join("secret.env").exists());
     assert!(!fixture.path().join("debug.log").exists());
     assert!(fixture.path().join("main.rs").exists());
+}
+
+// ══════════════════════════════════════════════════════════════════
+// Phase 7 — Flatten merge
+// ══════════════════════════════════════════════════════════════════
+
+/// Helper: create a fixture with a merge.
+///
+/// Layout (newest first):
+///   c4 "after merge"  ← main
+///   M  "Merge feature" (parents: c2, c3)
+///   c3 "feature work"  ← was on feature branch
+///   c2 "second"
+///   c1 "first"          ← root
+fn fixture_with_merge() -> (RepoFixture, Vec<gunk_core::Commit>) {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "first", &[("a.txt", "a")]);
+    fixture.commit("c2", "second", &[("b.txt", "b")]);
+    fixture.checkout_new_branch("feature");
+    fixture.commit("c3", "feature work", &[("c.txt", "c")]);
+    fixture.checkout("main");
+    fixture.merge("M", "feature", "Merge feature");
+    fixture.commit("c4", "after merge", &[("d.txt", "d")]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    let commits = git.walk_commits("main").unwrap();
+    (fixture, commits)
+}
+
+// ── Flatten: basic merge at tip ────────────────────────────────────
+
+#[test]
+fn flatten_merge_at_tip() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "first", &[("a.txt", "a")]);
+    fixture.commit("c2", "second", &[("b.txt", "b")]);
+    fixture.checkout_new_branch("feature");
+    fixture.commit("c3", "feature work", &[("c.txt", "c")]);
+    fixture.checkout("main");
+    fixture.merge("M", "feature", "Merge feature");
+    // M is the branch tip.
+
+    let git = Git::open(fixture.path()).unwrap();
+    let commits = git.walk_commits("main").unwrap();
+    let merge_commit = commits.iter().find(|c| c.is_merge()).unwrap();
+
+    let spec = FlattenSpec {
+        merge: merge_commit.id.clone(),
+        mainline_parent: merge_commit.parents[0].clone(),
+        message: merge_commit.summary.clone(),
+    };
+
+    let result = execute_flatten(&git, "main", &spec).unwrap();
+
+    // Result should have a backup ref.
+    assert!(result.backup_ref.starts_with("refs/gunk/backup/main/"));
+
+    // New history should be linear (no merge commits).
+    let new_commits = git.walk_commits("main").unwrap();
+    for c in &new_commits {
+        assert!(
+            c.parents.len() <= 1,
+            "expected linear history, but commit {} has {} parents",
+            c.id.short(),
+            c.parents.len()
+        );
+    }
+
+    // The tree at the new tip should be identical to the original merge tree.
+    let new_tree = fixture.git(["rev-parse", &format!("{}^{{tree}}", result.new_tip)]);
+    let old_tree = fixture.git(["rev-parse", &format!("{}^{{tree}}", merge_commit.id.0)]);
+    assert_eq!(
+        new_tree.trim(),
+        old_tree.trim(),
+        "flattened commit tree should be byte-identical to merge tree"
+    );
+
+    // All files should still exist.
+    assert!(fixture.path().join("a.txt").exists());
+    assert!(fixture.path().join("b.txt").exists());
+    assert!(fixture.path().join("c.txt").exists());
+}
+
+// ── Flatten: merge in the middle with descendants ──────────────────
+
+#[test]
+fn flatten_merge_in_middle_rebases_descendants() {
+    let (fixture, commits) = fixture_with_merge();
+    let merge_commit = commits.iter().find(|c| c.is_merge()).unwrap();
+
+    let git = Git::open(fixture.path()).unwrap();
+
+    let spec = FlattenSpec {
+        merge: merge_commit.id.clone(),
+        mainline_parent: merge_commit.parents[0].clone(),
+        message: merge_commit.summary.clone(),
+    };
+
+    let result = execute_flatten(&git, "main", &spec).unwrap();
+
+    // History should be linear.
+    let new_commits = git.walk_commits("main").unwrap();
+    for c in &new_commits {
+        assert!(
+            c.parents.len() <= 1,
+            "expected linear history after flatten"
+        );
+    }
+
+    // Should still have a commit after the flattened merge (c4).
+    let summaries: Vec<&str> = new_commits.iter().map(|c| c.summary.as_str()).collect();
+    assert!(
+        summaries.contains(&"after merge"),
+        "descendant commit should be preserved: {summaries:?}"
+    );
+
+    // All files should exist.
+    assert!(fixture.path().join("a.txt").exists());
+    assert!(fixture.path().join("b.txt").exists());
+    assert!(fixture.path().join("c.txt").exists());
+    assert!(fixture.path().join("d.txt").exists());
+
+    // Backup ref should exist.
+    assert!(result.backup_ref.starts_with("refs/gunk/backup/main/"));
+}
+
+// ── Flatten: tree is byte-identical to merge result ────────────────
+
+#[test]
+fn flatten_preserves_merge_tree_exactly() {
+    let (fixture, commits) = fixture_with_merge();
+    let merge_commit = commits.iter().find(|c| c.is_merge()).unwrap();
+
+    // Record the merge commit's tree before flatten.
+    let original_merge_tree =
+        fixture.git(["rev-parse", &format!("{}^{{tree}}", merge_commit.id.0)]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    let spec = FlattenSpec {
+        merge: merge_commit.id.clone(),
+        mainline_parent: merge_commit.parents[0].clone(),
+        message: "Flattened merge".to_string(),
+    };
+
+    execute_flatten(&git, "main", &spec).unwrap();
+
+    // Find the flattened commit (parent of c4's new OID).
+    let new_commits = git.walk_commits("main").unwrap();
+    // The flattened commit should have the custom message.
+    let flattened = new_commits
+        .iter()
+        .find(|c| c.summary == "Flattened merge")
+        .expect("should find flattened commit");
+
+    let new_tree = fixture.git(["rev-parse", &format!("{}^{{tree}}", flattened.id.0)]);
+    assert_eq!(original_merge_tree.trim(), new_tree.trim());
+
+    // The flattened commit should have exactly one parent.
+    assert_eq!(flattened.parents.len(), 1);
+}
+
+// ── Flatten: merge with previously resolved conflicts ──────────────
+
+#[test]
+fn flatten_merge_with_resolved_conflicts() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "init", &[("shared.txt", "original")]);
+    fixture.checkout_new_branch("feature");
+    fixture.commit("c2", "feature change", &[("shared.txt", "feature version")]);
+    fixture.checkout("main");
+    fixture.commit("c3", "main change", &[("shared.txt", "main version")]);
+
+    // Resolve conflict manually and create merge.
+    let merge_output = fixture.git_raw(["merge", "--no-ff", "feature", "-m", "Merge feature"]);
+    if !merge_output.status.success() {
+        // Resolve conflict: use the feature version.
+        std::fs::write(fixture.path().join("shared.txt"), "resolved content").unwrap();
+        fixture.git(["add", "shared.txt"]);
+        fixture.git(["commit", "-m", "Merge feature"]);
+    }
+
+    let git = Git::open(fixture.path()).unwrap();
+    let commits = git.walk_commits("main").unwrap();
+    let merge_commit = commits.iter().find(|c| c.is_merge()).unwrap();
+
+    let merge_tree = fixture.git(["rev-parse", &format!("{}^{{tree}}", merge_commit.id.0)]);
+
+    let spec = FlattenSpec {
+        merge: merge_commit.id.clone(),
+        mainline_parent: merge_commit.parents[0].clone(),
+        message: merge_commit.summary.clone(),
+    };
+
+    execute_flatten(&git, "main", &spec).unwrap();
+
+    // The tree at the tip should match the original merge tree (conflict resolution preserved).
+    let new_tree = fixture.git(["rev-parse", &format!("HEAD^{{tree}}")]);
+    assert_eq!(
+        merge_tree.trim(),
+        new_tree.trim(),
+        "resolved conflict state must be preserved after flatten"
+    );
+}
+
+// ── Flatten: dirty tree refused ────────────────────────────────────
+
+#[test]
+fn flatten_refuses_dirty_tree() {
+    let (fixture, commits) = fixture_with_merge();
+    let merge_commit = commits.iter().find(|c| c.is_merge()).unwrap();
+
+    // Dirty the working tree.
+    std::fs::write(fixture.path().join("a.txt"), "dirty").unwrap();
+
+    let git = Git::open(fixture.path()).unwrap();
+    let spec = FlattenSpec {
+        merge: merge_commit.id.clone(),
+        mainline_parent: merge_commit.parents[0].clone(),
+        message: merge_commit.summary.clone(),
+    };
+
+    let err = execute_flatten(&git, "main", &spec).unwrap_err();
+    assert!(err.to_string().contains("dirty"));
+}
+
+// ── Flatten: backup ref is created ─────────────────────────────────
+
+#[test]
+fn flatten_creates_backup_ref() {
+    let (fixture, commits) = fixture_with_merge();
+    let merge_commit = commits.iter().find(|c| c.is_merge()).unwrap();
+    let original_tip = fixture.rev_parse("main");
+
+    let git = Git::open(fixture.path()).unwrap();
+    let spec = FlattenSpec {
+        merge: merge_commit.id.clone(),
+        mainline_parent: merge_commit.parents[0].clone(),
+        message: merge_commit.summary.clone(),
+    };
+
+    let result = execute_flatten(&git, "main", &spec).unwrap();
+
+    // Backup ref should point at the original tip.
+    let backup_oid = fixture.rev_parse(&result.backup_ref);
+    assert_eq!(backup_oid, original_tip);
+}
+
+// ── Flatten: restore from backup ───────────────────────────────────
+
+#[test]
+fn flatten_restore_from_backup() {
+    let (fixture, commits) = fixture_with_merge();
+    let merge_commit = commits.iter().find(|c| c.is_merge()).unwrap();
+    let original_tip = fixture.rev_parse("main");
+    let original_count = commits.len();
+
+    let git = Git::open(fixture.path()).unwrap();
+    let spec = FlattenSpec {
+        merge: merge_commit.id.clone(),
+        mainline_parent: merge_commit.parents[0].clone(),
+        message: merge_commit.summary.clone(),
+    };
+
+    let result = execute_flatten(&git, "main", &spec).unwrap();
+
+    // Restore from backup.
+    restore_backup(&git, "main", &result.backup_ref).unwrap();
+
+    let restored_tip = fixture.rev_parse("main");
+    assert_eq!(restored_tip, original_tip);
+
+    // History should be fully restored (including the merge).
+    let restored_commits = git.walk_commits("main").unwrap();
+    assert_eq!(restored_commits.len(), original_count);
+
+    let has_merge = restored_commits.iter().any(|c| c.is_merge());
+    assert!(has_merge, "merge commit should be restored");
+}
+
+// ── Flatten: fast-forward merge ────────────────────────────────────
+
+#[test]
+fn flatten_ff_style_merge() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "first", &[("a.txt", "a")]);
+    // Create a feature branch with one commit.
+    fixture.checkout_new_branch("feature");
+    fixture.commit("c2", "feature work", &[("b.txt", "b")]);
+    fixture.checkout("main");
+    // Force a merge commit even though it could fast-forward.
+    fixture.merge("M", "feature", "Merge feature (ff)");
+
+    let git = Git::open(fixture.path()).unwrap();
+    let commits = git.walk_commits("main").unwrap();
+    let merge_commit = commits.iter().find(|c| c.is_merge()).unwrap();
+
+    let spec = FlattenSpec {
+        merge: merge_commit.id.clone(),
+        mainline_parent: merge_commit.parents[0].clone(),
+        message: merge_commit.summary.clone(),
+    };
+
+    execute_flatten(&git, "main", &spec).unwrap();
+
+    let new_commits = git.walk_commits("main").unwrap();
+    for c in &new_commits {
+        assert!(c.parents.len() <= 1, "history should be linear");
+    }
+
+    // All files present.
+    assert!(fixture.path().join("a.txt").exists());
+    assert!(fixture.path().join("b.txt").exists());
+}
+
+// ── Flatten via execute_plan ───────────────────────────────────────
+
+#[test]
+fn execute_plan_handles_flatten() {
+    let (fixture, commits) = fixture_with_merge();
+    let merge_commit = commits.iter().find(|c| c.is_merge()).unwrap();
+
+    let git = Git::open(fixture.path()).unwrap();
+
+    let operations = vec![Operation::FlattenMerge {
+        merge: merge_commit.id.clone(),
+    }];
+    let exec_plan = plan(&commits, &operations).unwrap();
+
+    let result = execute_plan(&git, "main", &exec_plan).unwrap();
+
+    let new_commits = git.walk_commits("main").unwrap();
+    for c in &new_commits {
+        assert!(c.parents.len() <= 1, "history should be linear");
+    }
+    assert!(result.backup_ref.starts_with("refs/gunk/backup/main/"));
+}
+
+// ── Flatten + squash composite ─────────────────────────────────────
+
+#[test]
+fn flatten_then_squash_composite() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "first", &[("a.txt", "a")]);
+    fixture.commit("c2", "second", &[("b.txt", "b")]);
+    fixture.checkout_new_branch("feature");
+    fixture.commit("c3", "feature work", &[("c.txt", "c")]);
+    fixture.checkout("main");
+    fixture.merge("M", "feature", "Merge feature");
+    fixture.commit("c4", "after merge", &[("d.txt", "d")]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    let commits = git.walk_commits("main").unwrap();
+    let merge_commit = commits.iter().find(|c| c.is_merge()).unwrap();
+
+    // Step 1: flatten.
+    let flatten_spec = FlattenSpec {
+        merge: merge_commit.id.clone(),
+        mainline_parent: merge_commit.parents[0].clone(),
+        message: merge_commit.summary.clone(),
+    };
+    execute_flatten(&git, "main", &flatten_spec).unwrap();
+
+    // Step 2: re-snapshot and squash.
+    let new_commits = git.walk_commits("main").unwrap();
+    assert!(
+        new_commits.iter().all(|c| c.parents.len() <= 1),
+        "should be linear after flatten"
+    );
+
+    // Squash the last two commits.
+    let operations = vec![Operation::Squash {
+        keep: new_commits[1].id.clone(),
+        absorb: vec![new_commits[0].id.clone()],
+    }];
+    let exec_plan = plan(&new_commits, &operations).unwrap();
+    execute_plan(&git, "main", &exec_plan).unwrap();
+
+    let final_commits = git.walk_commits("main").unwrap();
+    assert!(
+        final_commits.len() < new_commits.len(),
+        "squash should reduce commit count"
+    );
+
+    // All files should still exist.
+    assert!(fixture.path().join("a.txt").exists());
+    assert!(fixture.path().join("b.txt").exists());
+    assert!(fixture.path().join("c.txt").exists());
+    assert!(fixture.path().join("d.txt").exists());
+}
+
+// ── Flatten: message is preserved ──────────────────────────────────
+
+#[test]
+fn flatten_preserves_custom_message() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "first", &[("a.txt", "a")]);
+    fixture.checkout_new_branch("feature");
+    fixture.commit("c2", "feature work", &[("b.txt", "b")]);
+    fixture.checkout("main");
+    fixture.merge("M", "feature", "My custom merge message");
+
+    let git = Git::open(fixture.path()).unwrap();
+    let commits = git.walk_commits("main").unwrap();
+    let merge_commit = commits.iter().find(|c| c.is_merge()).unwrap();
+
+    let spec = FlattenSpec {
+        merge: merge_commit.id.clone(),
+        mainline_parent: merge_commit.parents[0].clone(),
+        message: "Flattened: feature branch".to_string(),
+    };
+
+    execute_flatten(&git, "main", &spec).unwrap();
+
+    let new_commits = git.walk_commits("main").unwrap();
+    let has_msg = new_commits
+        .iter()
+        .any(|c| c.summary == "Flattened: feature branch");
+    assert!(has_msg, "custom message should appear in flattened commit");
+}
+
+// ── Flatten: descendant rebase conflict is reported cleanly ────────
+
+#[test]
+fn flatten_conflict_during_descendant_rebase_leaves_branch_untouched() {
+    let mut fixture = RepoFixture::new();
+    // c1: base with shared file.
+    fixture.commit("c1", "init", &[("shared.txt", "base")]);
+
+    // feature branch modifies shared.txt.
+    fixture.checkout_new_branch("feature");
+    fixture.commit("c2", "feature change", &[("shared.txt", "feature version")]);
+    fixture.checkout("main");
+
+    // main also modifies shared.txt (will be resolved in merge).
+    fixture.commit("c3", "main change", &[("shared.txt", "main version")]);
+
+    // Merge with manual conflict resolution.
+    let merge_output = fixture.git_raw(["merge", "--no-ff", "feature", "-m", "Merge feature"]);
+    if !merge_output.status.success() {
+        std::fs::write(fixture.path().join("shared.txt"), "resolved").unwrap();
+        fixture.git(["add", "shared.txt"]);
+        fixture.git(["commit", "-m", "Merge feature"]);
+    }
+
+    // Post-merge commit that also modifies shared.txt in a way that will
+    // conflict when rebased onto the flattened commit (which has the merge's
+    // tree, not c3's tree).
+    fixture.commit(
+        "c4",
+        "post-merge edit",
+        &[("shared.txt", "post-merge content")],
+    );
+
+    let original_tip = fixture.rev_parse("main");
+    let git = Git::open(fixture.path()).unwrap();
+    let commits = git.walk_commits("main").unwrap();
+    let merge_commit = commits.iter().find(|c| c.is_merge()).unwrap();
+
+    let spec = FlattenSpec {
+        merge: merge_commit.id.clone(),
+        mainline_parent: merge_commit.parents[0].clone(),
+        message: merge_commit.summary.clone(),
+    };
+
+    // This may succeed (no conflict because tree is identical) or fail.
+    // The important thing is the branch is either correctly updated or untouched.
+    let result = execute_flatten(&git, "main", &spec);
+
+    match result {
+        Ok(_) => {
+            // If it succeeds, history should be linear.
+            let new_commits = git.walk_commits("main").unwrap();
+            for c in &new_commits {
+                assert!(c.parents.len() <= 1, "expected linear history");
+            }
+        }
+        Err(e) => {
+            // If it fails, real branch must be untouched.
+            let current_tip = fixture.rev_parse("main");
+            assert_eq!(
+                current_tip, original_tip,
+                "on failure, real branch should be untouched: {e}"
+            );
+        }
+    }
 }
