@@ -84,7 +84,6 @@ struct RepoState {
 }
 
 struct CommitDetail {
-    _oid: String,
     changed_paths: Vec<PathChange>,
     diff: String,
 }
@@ -97,6 +96,22 @@ enum PendingLoadKind {
 struct PendingLoad {
     request_id: u64,
     kind: PendingLoadKind,
+    message: String,
+}
+
+struct ExecOutcome {
+    exec_result: ExecuteResult,
+    commits: Vec<Commit>,
+    has_more: bool,
+}
+
+struct ExecResponse {
+    request_id: u64,
+    result: Result<ExecOutcome, String>,
+}
+
+struct PendingExec {
+    request_id: u64,
     message: String,
 }
 
@@ -129,6 +144,8 @@ struct App {
     error: Option<String>,
     load_rx: Option<Receiver<LoadResponse>>,
     pending_load: Option<PendingLoad>,
+    exec_rx: Option<Receiver<ExecResponse>>,
+    pending_exec: Option<PendingExec>,
     next_request_id: u64,
 }
 
@@ -320,6 +337,62 @@ impl App {
         }
     }
 
+    fn poll_background_exec(&mut self) {
+        let response = {
+            let Some(rx) = &self.exec_rx else { return };
+            match rx.try_recv() {
+                Ok(r) => Some(r),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => {
+                    self.exec_rx = None;
+                    self.pending_exec = None;
+                    self.error = Some("Background execution failed unexpectedly.".to_string());
+                    None
+                }
+            }
+        };
+
+        let Some(response) = response else { return };
+        let Some(pending) = self.pending_exec.take() else {
+            return;
+        };
+        if pending.request_id != response.request_id {
+            return;
+        }
+        self.exec_rx = None;
+
+        match response.result {
+            Err(err) => {
+                if let Some(repo) = &mut self.repo {
+                    repo.execute_result = Some(Err(err));
+                }
+            }
+            Ok(outcome) => {
+                if let Some(repo) = &mut self.repo {
+                    repo.execute_result = Some(Ok(outcome.exec_result));
+                    repo.selection = SelectionState::new(outcome.commits.len());
+                    repo.commits = outcome.commits;
+                    repo.has_more_commits = outcome.has_more;
+                    repo.draft = DraftState::new();
+                    repo.preview_rows.clear();
+                    repo.plan_error = None;
+                    repo.detail = None;
+                    repo.search_query.clear();
+                    repo.search_hits.clear();
+                    repo.search_match_indices.clear();
+                    repo.reword_summary.clear();
+                    repo.reword_body.clear();
+                    repo.author_name.clear();
+                    repo.author_email.clear();
+                    repo.co_author_name.clear();
+                    repo.co_author_email.clear();
+                    repo.files_selected_for_removal.clear();
+                    repo.add_to_gitignore = false;
+                }
+            }
+        }
+    }
+
     fn apply_selection_msg(&mut self, msg: SelectionMsg) {
         if let Some(repo) = &mut self.repo {
             repo.selection = repo.selection.reduce(msg);
@@ -343,7 +416,6 @@ impl App {
                 match (repo.git.changed_paths(&oid), repo.git.show_diff(&oid)) {
                     (Ok(changed_paths), Ok(diff)) => {
                         repo.detail = Some(CommitDetail {
-                            _oid: oid,
                             changed_paths,
                             diff,
                         });
@@ -444,180 +516,54 @@ impl App {
 
     /// Execute the current draft plan against the repository.
     ///
-    /// For composite plans, this handles the
-    /// flatten → filter-repo → re-snapshot → rebase pipeline: flatten and
-    /// filter-repo both rewrite OIDs, so subsequent phases must re-derive
-    /// from a fresh snapshot.
+    /// Delegates composite OID remapping entirely to `gitio::execute_plan`
+    /// (which handles flatten → filter-repo → rebase ordering with correct
+    /// OID retargeting between phases). The UI thread only calls `plan()` to
+    /// validate; the actual git work runs on a background thread (M2).
     fn execute_plan(&mut self) {
         let Some(repo) = &mut self.repo else { return };
+        if self.pending_exec.is_some() {
+            return;
+        }
 
         let branch = repo.branches[repo.selected_branch].name.clone();
 
-        // Separate operations into flatten, filter-repo, and rebase groups.
-        let flatten_ops: Vec<_> = repo
-            .draft
-            .ops
-            .iter()
-            .filter(|op| matches!(op, gunk_core::Operation::FlattenMerge { .. }))
-            .cloned()
-            .collect();
-        let filter_ops: Vec<_> = repo
-            .draft
-            .ops
-            .iter()
-            .filter(|op| matches!(op, gunk_core::Operation::RemovePaths { .. }))
-            .cloned()
-            .collect();
-        let rebase_ops: Vec<_> = repo
-            .draft
-            .ops
-            .iter()
-            .filter(|op| {
-                !matches!(
-                    op,
-                    gunk_core::Operation::RemovePaths { .. }
-                        | gunk_core::Operation::FlattenMerge { .. }
-                )
-            })
-            .cloned()
-            .collect();
-
-        let has_flatten = !flatten_ops.is_empty();
-        let has_filter = !filter_ops.is_empty();
-        let has_rebase = !rebase_ops.is_empty();
-        let remaining_after_flatten = has_filter || has_rebase;
-        let remaining_after_filter = has_rebase;
-
-        // Phase 0: Execute flatten (if any) — must precede filter-repo and rebase.
-        if has_flatten {
-            let flatten_plan = plan(&repo.commits, &flatten_ops);
-            match flatten_plan {
-                Err(e) => {
-                    repo.execute_result = Some(Err(format!("Plan error: {e}")));
-                    return;
-                }
-                Ok(fp) => match gitio_execute_plan(&repo.git, &branch, &fp) {
-                    Err(e) => {
-                        repo.execute_result = Some(Err(format!("{e}")));
-                        return;
-                    }
-                    Ok(flatten_result) => {
-                        if !remaining_after_flatten {
-                            repo.execute_result = Some(Ok(flatten_result));
-                        }
-                        // Re-snapshot after flatten (OIDs changed).
-                        match repo.git.walk_commits(&branch) {
-                            Ok(c) => {
-                                repo.has_more_commits = false;
-                                repo.commits = c;
-                            }
-                            Err(e) => {
-                                repo.execute_result =
-                                    Some(Err(format!("Failed to reload after flatten: {e}")));
-                                return;
-                            }
-                        }
-                        if !remaining_after_flatten {
-                            self.reset_draft_state();
-                            return;
-                        }
-                    }
-                },
-            }
-        }
-
-        // Phase 1: Execute filter-repo (if any).
-        if has_filter {
-            let filter_plan = plan(&repo.commits, &filter_ops);
-            match filter_plan {
-                Err(e) => {
-                    repo.execute_result = Some(Err(format!("Plan error: {e}")));
-                    return;
-                }
-                Ok(fp) => match gitio_execute_plan(&repo.git, &branch, &fp) {
-                    Err(e) => {
-                        repo.execute_result = Some(Err(format!("{e}")));
-                        return;
-                    }
-                    Ok(filter_result) => {
-                        if !remaining_after_filter {
-                            // Only filter-repo (and maybe flatten before it), no rebase needed.
-                            repo.execute_result = Some(Ok(filter_result));
-                        }
-                        // Re-snapshot after filter-repo (OIDs changed).
-                        match repo.git.walk_commits(&branch) {
-                            Ok(c) => {
-                                repo.has_more_commits = false;
-                                repo.commits = c;
-                            }
-                            Err(e) => {
-                                repo.execute_result =
-                                    Some(Err(format!("Failed to reload after filter-repo: {e}")));
-                                return;
-                            }
-                        }
-                        // If there are no rebase ops, we're done. Save the filter result.
-                        if !remaining_after_filter {
-                            self.reset_draft_state();
-                            return;
-                        }
-                    }
-                },
-            }
-        }
-
-        // Phase 2: Execute rebase ops (against fresh or original snapshot).
-        if has_rebase {
-            let rebase_plan = plan(&repo.commits, &rebase_ops);
-            match rebase_plan {
-                Err(e) => {
-                    repo.execute_result = Some(Err(format!("Plan error: {e}")));
-                }
-                Ok(rp) => match gitio_execute_plan(&repo.git, &branch, &rp) {
-                    Ok(exec_result) => {
-                        repo.execute_result = Some(Ok(exec_result));
-                        self.reset_draft_state();
-                    }
-                    Err(e) => {
-                        repo.execute_result = Some(Err(format!("{e}")));
-                    }
-                },
-            }
-        }
-    }
-
-    /// Reset draft state and reload commits after successful execution.
-    fn reset_draft_state(&mut self) {
-        let Some(repo) = &mut self.repo else { return };
-        let branch = repo.branches[repo.selected_branch].name.clone();
-        repo.draft = DraftState::new();
-        repo.preview_rows.clear();
-        repo.plan_error = None;
-        repo.detail = None;
-        repo.search_query.clear();
-        repo.search_hits.clear();
-        repo.search_match_indices.clear();
-        repo.reword_summary.clear();
-        repo.reword_body.clear();
-        repo.author_name.clear();
-        repo.author_email.clear();
-        repo.co_author_name.clear();
-        repo.co_author_email.clear();
-        repo.files_selected_for_removal.clear();
-        repo.add_to_gitignore = false;
-        match read_commit_window(&repo.git, &branch, repo.commits.len()) {
-            Ok((commits, has_more_commits)) => {
-                repo.selection = SelectionState::new(commits.len());
-                repo.commits = commits;
-                repo.has_more_commits = has_more_commits;
-            }
+        // Plan on the UI thread — pure + fast; surface errors inline.
+        let exec_plan = match plan(&repo.commits, &repo.draft.ops) {
+            Ok(p) => p,
             Err(e) => {
-                repo.selection = SelectionState::new(0);
-                repo.commits.clear();
-                repo.has_more_commits = false;
-                self.error = Some(format!("Failed to reload commits: {e}"));
+                repo.execute_result = Some(Err(format!("Plan error: {e}")));
+                return;
             }
-        }
+        };
+
+        // Move owned data into the worker thread.
+        let git = repo.git.clone();
+        let loaded_count = repo.commits.len();
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.saturating_add(1);
+
+        let (tx, rx) = mpsc::channel();
+        self.exec_rx = Some(rx);
+        self.pending_exec = Some(PendingExec {
+            request_id,
+            message: format!("Applying {n} operation(s)…", n = repo.draft.len()),
+        });
+
+        thread::spawn(move || {
+            let result = (|| -> Result<ExecOutcome, String> {
+                let exec_result = gitio_execute_plan(&git, &branch, &exec_plan)
+                    .map_err(|e| format!("{e}"))?;
+                let (commits, has_more) = read_commit_window(&git, &branch, loaded_count)
+                    .map_err(|e| format!("Failed to reload commits: {e}"))?;
+                Ok(ExecOutcome {
+                    exec_result,
+                    commits,
+                    has_more,
+                })
+            })();
+            let _ = tx.send(ExecResponse { request_id, result });
+        });
     }
 
     /// Load backup refs for the current branch.
@@ -668,7 +614,8 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_background_load();
-        if self.pending_load.is_some() {
+        self.poll_background_exec();
+        if self.pending_load.is_some() || self.pending_exec.is_some() {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
 
@@ -676,12 +623,14 @@ impl eframe::App for App {
         let mut request_open_repo: Option<PathBuf> = None;
         let mut request_switch_branch: Option<usize> = None;
         let is_loading = self.pending_load.is_some();
+        let is_executing = self.pending_exec.is_some();
+        let is_busy = is_loading || is_executing;
 
         // Top bar
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(!is_loading, egui::Button::new("📂 Open Repository"))
+                    .add_enabled(!is_busy, egui::Button::new("📂 Open Repository"))
                     .clicked()
                     && let Some(path) = rfd::FileDialog::new().pick_folder()
                 {
@@ -692,7 +641,7 @@ impl eframe::App for App {
                     ui.separator();
                     let current = repo.branches[repo.selected_branch].name.clone();
                     let mut new_idx = repo.selected_branch;
-                    ui.add_enabled_ui(!is_loading, |ui| {
+                    ui.add_enabled_ui(!is_busy, |ui| {
                         egui::ComboBox::from_label("Branch")
                             .selected_text(&current)
                             .show_ui(ui, |ui| {
@@ -701,7 +650,7 @@ impl eframe::App for App {
                                 }
                             });
                     });
-                    if !is_loading && new_idx != repo.selected_branch {
+                    if !is_busy && new_idx != repo.selected_branch {
                         request_switch_branch = Some(new_idx);
                     }
 
@@ -712,7 +661,7 @@ impl eframe::App for App {
                     ));
 
                     if repo.has_more_commits
-                        && !is_loading
+                        && !is_busy
                         && ui
                             .button(format!("Load {} more", COMMIT_PAGE_SIZE))
                             .clicked()
@@ -738,6 +687,15 @@ impl eframe::App for App {
 
         if let Some(pending) = &self.pending_load {
             egui::TopBottomPanel::top("loading_banner").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(&pending.message);
+                });
+            });
+        }
+
+        if let Some(pending) = &self.pending_exec {
+            egui::TopBottomPanel::top("exec_banner").show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(&pending.message);
@@ -813,7 +771,6 @@ impl eframe::App for App {
         // Detail pane (right side)
         let mut selection_msg: Option<SelectionMsg> = None;
         let mut draft_msg: Option<DraftMsg> = None;
-        let mut recompute_preview = false;
 
         egui::SidePanel::right("detail_pane")
             .default_width(450.0)
@@ -1019,17 +976,7 @@ impl eframe::App for App {
                         ui.separator();
 
                         if ui.button("🗑 Drop all").clicked() {
-                            // Drop is a per-commit toggle; add a drop for each
-                            // target that is not already dropped.
-                            for t in &targets {
-                                let already = repo.draft.ops.iter().any(|op| {
-                                    matches!(op, gunk_core::Operation::Drop { target } if target == t)
-                                });
-                                if !already {
-                                    repo.draft = repo.draft.reduce(DraftMsg::ToggleDrop(t.clone()));
-                                }
-                            }
-                            recompute_preview = true;
+                            draft_msg = Some(DraftMsg::DropMany(targets.clone()));
                         }
                         ui.horizontal(|ui| {
                             if ui.button("⬇ Squash into oldest").clicked() {
@@ -1134,6 +1081,7 @@ impl eframe::App for App {
                             clear_draft = true;
                         }
                         if repo.plan_error.is_none()
+                            && !is_executing
                             && ui
                                 .button(
                                     egui::RichText::new("✓ Confirm & Apply")
@@ -1358,8 +1306,6 @@ impl eframe::App for App {
         }
         if let Some(msg) = draft_msg {
             self.apply_draft_msg(msg);
-        } else if recompute_preview {
-            self.recompute_preview();
         }
         if let Some(msg) = selection_msg {
             self.apply_selection_msg(msg);
