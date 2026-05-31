@@ -16,6 +16,7 @@ Options considered:
 
 - **Language:** Rust (stable toolchain).
 - **GUI:** `eframe` / `egui` — immediate-mode, single binary, utilitarian.
+- **Native dialogs:** `rfd` — cross-platform file/folder picker dialogs (used for "Open Repository").
 - **Git:** user's `git` binary (required) + `git-filter-repo` (optional).
 - **Serialization:** `serde` for plan inspection, debugging, and snapshot tests.
 - **Errors:** `thiserror` for typed errors in `core`/`gitio`.
