@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::model::{Commit, CommitId, Identity};
+use crate::model::{CoAuthor, Commit, CommitId, Identity};
 use crate::operation::Operation;
 
 use super::{PlanError, RebaseTodo, RebaseTodoLine, format_message, shell_escape};
@@ -26,6 +26,7 @@ pub(super) fn build_rebase_todo(
 
     let mut rewords: HashMap<&CommitId, String> = HashMap::new();
     let mut author_changes: HashMap<&CommitId, Identity> = HashMap::new();
+    let mut co_author_changes: HashMap<&CommitId, Vec<CoAuthor>> = HashMap::new();
     let mut drops: HashSet<&CommitId> = HashSet::new();
     let mut squash_groups: Vec<(&CommitId, Vec<&CommitId>, bool)> = Vec::new();
     let mut reorder: Option<&Vec<CommitId>> = None;
@@ -54,6 +55,14 @@ pub(super) fn build_rebase_todo(
                     author_changes.insert(t, author.clone());
                 }
             }
+            Operation::SetCoAuthors {
+                targets,
+                co_authors,
+            } => {
+                for t in targets {
+                    co_author_changes.insert(t, co_authors.clone());
+                }
+            }
             Operation::Drop { target } => {
                 drops.insert(target);
             }
@@ -68,6 +77,31 @@ pub(super) fn build_rebase_todo(
             }
             _ => {}
         }
+    }
+
+    // ── Merge co-author changes into rewords ───────────────────────
+    //
+    // Co-author trailers live in the commit body. If a commit has a
+    // SetCoAuthors operation, we rebuild the body with the new trailers.
+    // If the commit also has a Reword/SetMessage, we apply trailers on
+    // top of the already-rewritten message; otherwise we start from the
+    // original commit message.
+
+    use crate::model::set_co_authors_in_body;
+
+    for (id, co_authors) in &co_author_changes {
+        let base_msg = if let Some(existing) = rewords.get(id) {
+            existing.clone()
+        } else {
+            // Use the original commit message.
+            let commit = &snapshot[commit_index[id]];
+            format_message(&commit.summary, &commit.body)
+        };
+
+        // Split message into summary + body (first line vs rest).
+        let (summary, body) = split_message(&base_msg);
+        let new_body = set_co_authors_in_body(&body, co_authors);
+        rewords.insert(id, format_message(&summary, &new_body));
     }
 
     // ── Apply user reorder ─────────────────────────────────────────
@@ -206,4 +240,16 @@ pub(super) fn build_rebase_todo(
         message_map,
         author_map,
     })
+}
+
+/// Split a full commit message into (summary, body).
+fn split_message(msg: &str) -> (String, String) {
+    match msg.find('\n') {
+        Some(pos) => {
+            let summary = msg[..pos].to_string();
+            let body = msg[pos + 1..].trim_start_matches('\n').to_string();
+            (summary, body)
+        }
+        None => (msg.to_string(), String::new()),
+    }
 }

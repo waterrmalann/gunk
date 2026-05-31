@@ -884,3 +884,140 @@ mod prop {
         }
     }
 }
+
+// ── SetCoAuthors tests ─────────────────────────────────────────
+
+#[test]
+fn set_co_authors_produces_reword_with_trailers() {
+    let mut snap = linear_snapshot();
+    snap[2].body = "Original body".to_string();
+    let ops = vec![Operation::SetCoAuthors {
+        targets: vec![cid("C")],
+        co_authors: vec![
+            crate::model::CoAuthor {
+                name: "Alice".into(),
+                email: "alice@x.com".into(),
+            },
+        ],
+    }];
+    let result = plan(&snap, &ops).unwrap();
+    if let ExecutionPlan::Rebase(todo) = result {
+        // Should have a message_map entry for C with co-author trailer.
+        let msg = todo.message_map.iter().find(|(id, _)| *id == cid("C"));
+        assert!(msg.is_some(), "expected message_map entry for C");
+        let (_, content) = msg.unwrap();
+        assert!(content.contains("Co-authored-by: Alice <alice@x.com>"));
+        assert!(content.contains("Message C"));
+    } else {
+        panic!("expected Rebase plan");
+    }
+}
+
+#[test]
+fn set_co_authors_removes_existing_trailers() {
+    let mut snap = linear_snapshot();
+    snap[2].body = "Body text\n\nCo-authored-by: Old <old@x.com>".to_string();
+    let ops = vec![Operation::SetCoAuthors {
+        targets: vec![cid("C")],
+        co_authors: vec![
+            crate::model::CoAuthor {
+                name: "New".into(),
+                email: "new@x.com".into(),
+            },
+        ],
+    }];
+    let result = plan(&snap, &ops).unwrap();
+    if let ExecutionPlan::Rebase(todo) = result {
+        let (_, content) = todo.message_map.iter().find(|(id, _)| *id == cid("C")).unwrap();
+        assert!(!content.contains("Old"));
+        assert!(content.contains("Co-authored-by: New <new@x.com>"));
+        assert!(content.contains("Body text"));
+    } else {
+        panic!("expected Rebase plan");
+    }
+}
+
+#[test]
+fn set_co_authors_empty_clears_trailers() {
+    let mut snap = linear_snapshot();
+    snap[2].body = "Body\n\nCo-authored-by: Alice <a@x.com>".to_string();
+    let ops = vec![Operation::SetCoAuthors {
+        targets: vec![cid("C")],
+        co_authors: vec![],
+    }];
+    let result = plan(&snap, &ops).unwrap();
+    if let ExecutionPlan::Rebase(todo) = result {
+        let (_, content) = todo.message_map.iter().find(|(id, _)| *id == cid("C")).unwrap();
+        assert!(!content.contains("Co-authored-by"));
+        assert!(content.contains("Body"));
+    } else {
+        panic!("expected Rebase plan");
+    }
+}
+
+#[test]
+fn set_co_authors_combined_with_reword() {
+    let snap = linear_snapshot();
+    let ops = vec![
+        Operation::Reword {
+            target: cid("C"),
+            summary: "New summary".into(),
+            body: "New body".into(),
+        },
+        Operation::SetCoAuthors {
+            targets: vec![cid("C")],
+            co_authors: vec![
+                crate::model::CoAuthor {
+                    name: "Alice".into(),
+                    email: "alice@x.com".into(),
+                },
+            ],
+        },
+    ];
+    let result = plan(&snap, &ops).unwrap();
+    if let ExecutionPlan::Rebase(todo) = result {
+        let (_, content) = todo.message_map.iter().find(|(id, _)| *id == cid("C")).unwrap();
+        assert!(content.contains("New summary"));
+        assert!(content.contains("New body"));
+        assert!(content.contains("Co-authored-by: Alice <alice@x.com>"));
+    } else {
+        panic!("expected Rebase plan");
+    }
+}
+
+#[test]
+fn set_co_authors_conflicts_with_drop() {
+    let snap = linear_snapshot();
+    let ops = vec![
+        Operation::Drop { target: cid("C") },
+        Operation::SetCoAuthors {
+            targets: vec![cid("C")],
+            co_authors: vec![],
+        },
+    ];
+    let err = plan(&snap, &ops).unwrap_err();
+    assert!(matches!(err, PlanError::ConflictingOps(_, _, _)));
+}
+
+#[test]
+fn set_co_authors_bulk_targets() {
+    let snap = linear_snapshot();
+    let ops = vec![Operation::SetCoAuthors {
+        targets: vec![cid("B"), cid("C"), cid("D")],
+        co_authors: vec![
+            crate::model::CoAuthor {
+                name: "Bob".into(),
+                email: "bob@x.com".into(),
+            },
+        ],
+    }];
+    let result = plan(&snap, &ops).unwrap();
+    if let ExecutionPlan::Rebase(todo) = result {
+        assert_eq!(todo.message_map.len(), 3);
+        for (_, content) in &todo.message_map {
+            assert!(content.contains("Co-authored-by: Bob <bob@x.com>"));
+        }
+    } else {
+        panic!("expected Rebase plan");
+    }
+}

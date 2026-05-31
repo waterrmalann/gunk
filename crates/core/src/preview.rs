@@ -109,6 +109,11 @@ pub fn preview(
                 reorder = Some(new_order);
             }
             Operation::RemovePaths { .. } => {}
+            Operation::SetCoAuthors { targets, .. } => {
+                for t in targets {
+                    reworded.insert(t);
+                }
+            }
         }
     }
 

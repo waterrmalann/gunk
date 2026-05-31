@@ -17,6 +17,7 @@ pub(super) fn collect_commit_ids(op: &Operation) -> Vec<&CommitId> {
         Operation::Reorder { new_order } => new_order.iter().collect(),
         Operation::RemovePaths { .. } => vec![],
         Operation::FlattenMerge { merge } => vec![merge],
+        Operation::SetCoAuthors { targets, .. } => targets.iter().collect(),
     }
 }
 
@@ -69,6 +70,7 @@ pub(super) fn detect_conflicts(rebase_ops: &[&Operation]) -> Result<(), PlanErro
     let mut reworded = HashSet::new();
     let mut set_messaged = HashSet::new();
     let mut set_authored = HashSet::new();
+    let mut set_co_authored = HashSet::new();
     let mut keeps = HashSet::new();
     let mut absorbed = HashSet::new();
     let mut reorder_count = 0u32;
@@ -89,6 +91,11 @@ pub(super) fn detect_conflicts(rebase_ops: &[&Operation]) -> Result<(), PlanErro
             Operation::SetAuthor { targets, .. } => {
                 for t in targets {
                     set_authored.insert(t);
+                }
+            }
+            Operation::SetCoAuthors { targets, .. } => {
+                for t in targets {
+                    set_co_authored.insert(t);
                 }
             }
             Operation::Squash { keep, absorb: abs } | Operation::Fixup { keep, absorb: abs } => {
@@ -124,6 +131,7 @@ pub(super) fn detect_conflicts(rebase_ops: &[&Operation]) -> Result<(), PlanErro
         (&reworded, "reword"),
         (&set_messaged, "set-message"),
         (&set_authored, "set-author"),
+        (&set_co_authored, "set-co-authors"),
         (&keeps, "squash/fixup (keep)"),
         (&absorbed, "squash/fixup (absorb)"),
     ];
@@ -165,6 +173,7 @@ pub(super) fn detect_conflicts(rebase_ops: &[&Operation]) -> Result<(), PlanErro
         (&reworded, "reword"),
         (&set_messaged, "set-message"),
         (&set_authored, "set-author"),
+        (&set_co_authored, "set-co-authors"),
     ];
 
     for id in &absorbed {
