@@ -1,0 +1,9 @@
+[package]
+name = "gunk-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gunk-core = { path = "../core" }
+tempfile = { workspace = true }

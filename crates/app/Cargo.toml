@@ -1,0 +1,11 @@
+[package]
+name = "gunk-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gunk-core = { path = "../core" }
+gunk-gitio = { path = "../gitio" }
+eframe = { workspace = true }
+egui = { workspace = true }
