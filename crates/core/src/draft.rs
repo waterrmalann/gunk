@@ -1,4 +1,4 @@
-use crate::model::{CommitId, Identity, PathSpec};
+use crate::model::{CoAuthor, CommitId, Identity, PathSpec};
 use crate::operation::Operation;
 
 /// The pending set of draft operations the user has accumulated.
@@ -56,6 +56,12 @@ pub enum DraftMsg {
     },
     /// Toggle flatten for a merge commit (add if absent, remove if present).
     ToggleFlatten(CommitId),
+    /// Set co-authors on one or more commits. Replaces any existing co-author
+    /// op covering the exact same target set.
+    SetCoAuthors {
+        targets: Vec<CommitId>,
+        co_authors: Vec<CoAuthor>,
+    },
     /// Remove the draft operation at the given index (no-op if out of range).
     RemoveOp(usize),
     /// Discard all drafts.
@@ -169,6 +175,18 @@ impl DraftState {
                     }
                     None => ops.push(Operation::FlattenMerge { merge }),
                 }
+            }
+            DraftMsg::SetCoAuthors {
+                targets,
+                co_authors,
+            } => {
+                ops.retain(
+                    |op| !matches!(op, Operation::SetCoAuthors { targets: t, .. } if *t == targets),
+                );
+                ops.push(Operation::SetCoAuthors {
+                    targets,
+                    co_authors,
+                });
             }
             DraftMsg::RemoveOp(idx) => {
                 if idx < ops.len() {
@@ -390,5 +408,63 @@ mod tests {
             .reduce(DraftMsg::ToggleFlatten(cid("M1")));
         assert_eq!(d.len(), 1);
         assert!(matches!(&d.ops[0], Operation::FlattenMerge { merge } if *merge == cid("M2")));
+    }
+
+    #[test]
+    fn set_co_authors_adds_operation() {
+        let d = DraftState::new().reduce(DraftMsg::SetCoAuthors {
+            targets: vec![cid("A")],
+            co_authors: vec![CoAuthor {
+                name: "Alice".into(),
+                email: "alice@x.com".into(),
+            }],
+        });
+        assert_eq!(d.len(), 1);
+        assert!(matches!(d.ops[0], Operation::SetCoAuthors { .. }));
+    }
+
+    #[test]
+    fn set_co_authors_same_targets_replaces() {
+        let d = DraftState::new()
+            .reduce(DraftMsg::SetCoAuthors {
+                targets: vec![cid("A")],
+                co_authors: vec![CoAuthor {
+                    name: "Alice".into(),
+                    email: "alice@x.com".into(),
+                }],
+            })
+            .reduce(DraftMsg::SetCoAuthors {
+                targets: vec![cid("A")],
+                co_authors: vec![CoAuthor {
+                    name: "Bob".into(),
+                    email: "bob@x.com".into(),
+                }],
+            });
+        assert_eq!(d.len(), 1);
+        if let Operation::SetCoAuthors { co_authors, .. } = &d.ops[0] {
+            assert_eq!(co_authors[0].name, "Bob");
+        } else {
+            panic!("expected SetCoAuthors");
+        }
+    }
+
+    #[test]
+    fn set_co_authors_different_targets_accumulates() {
+        let d = DraftState::new()
+            .reduce(DraftMsg::SetCoAuthors {
+                targets: vec![cid("A")],
+                co_authors: vec![CoAuthor {
+                    name: "Alice".into(),
+                    email: "alice@x.com".into(),
+                }],
+            })
+            .reduce(DraftMsg::SetCoAuthors {
+                targets: vec![cid("B")],
+                co_authors: vec![CoAuthor {
+                    name: "Bob".into(),
+                    email: "bob@x.com".into(),
+                }],
+            });
+        assert_eq!(d.len(), 2);
     }
 }

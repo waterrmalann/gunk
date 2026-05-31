@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::model::{CommitId, Identity, PathSpec};
+use crate::model::{CoAuthor, CommitId, Identity, PathSpec};
 
 /// A single user intent captured in draft mode.
 /// The plan engine turns a set of these into a concrete `ExecutionPlan`.
@@ -44,4 +44,9 @@ pub enum Operation {
     },
     /// Flatten a merge commit into a single ordinary commit.
     FlattenMerge { merge: CommitId },
+    /// Set co-authors on one or more commits (replaces existing co-author trailers).
+    SetCoAuthors {
+        targets: Vec<CommitId>,
+        co_authors: Vec<CoAuthor>,
+    },
 }
