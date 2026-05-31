@@ -17,6 +17,7 @@ time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
 # GUI
 eframe = "0.31"
 egui = "0.31"
+rfd = "0.15"
 
 # Testing
 tempfile = "3"
