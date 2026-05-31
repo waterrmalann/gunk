@@ -39,6 +39,7 @@ impl SelectionState {
     }
 
     /// Reducer: apply a message to produce the next state.
+    #[must_use = "reduce returns a new state; the original is unchanged"]
     pub fn reduce(&self, msg: SelectionMsg) -> Self {
         match msg {
             SelectionMsg::Click(idx) => {

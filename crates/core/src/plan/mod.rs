@@ -82,8 +82,6 @@ pub enum PlanError {
     SelfAbsorb(CommitId),
     #[error("multiple reorder operations are not allowed")]
     MultipleReorders,
-    #[error("{0}")]
-    Other(String),
     #[error("no operations to plan")]
     NoOperations,
 }
@@ -116,6 +114,7 @@ fn shell_escape(s: &str) -> String {
 ///
 /// Returns `Err(PlanError)` if operations reference unknown commits, are
 /// mutually contradictory, or violate structural invariants.
+#[must_use = "the computed plan must be used; discarding it loses the planning work"]
 pub fn plan(snapshot: &[Commit], operations: &[Operation]) -> Result<ExecutionPlan, PlanError> {
     if operations.is_empty() {
         return Err(PlanError::NoOperations);
