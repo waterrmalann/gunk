@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 
 use eframe::egui;
-use gunk_core::{ChangeStatus, Commit, PathChange};
+use gunk_core::{
+    ChangeStatus, Commit, PathChange, SearchHit, SelectionMsg, SelectionState, search_commits,
+    search_hit_indices,
+};
 use gunk_gitio::{BranchInfo, Git};
 
 fn main() -> eframe::Result {
@@ -26,9 +29,16 @@ struct RepoState {
     branches: Vec<BranchInfo>,
     selected_branch: usize,
     commits: Vec<Commit>,
-    selected_commit: Option<usize>,
-    /// Lazily loaded detail for the selected commit.
+    /// Commit selection (multi-select via Ctrl/Shift).
+    selection: SelectionState,
+    /// Lazily loaded detail for the focused commit (last clicked).
     detail: Option<CommitDetail>,
+    /// Current search query text.
+    search_query: String,
+    /// Cached search results (recomputed when query changes).
+    search_hits: Vec<SearchHit>,
+    /// Indices of commits matching the current search (for fast lookup).
+    search_match_indices: std::collections::BTreeSet<usize>,
 }
 
 struct CommitDetail {
@@ -62,13 +72,17 @@ impl App {
                             return;
                         }
                     };
+                    let selection = SelectionState::new(commits.len());
                     self.repo = Some(RepoState {
                         git,
                         branches,
                         selected_branch: 0,
                         commits,
-                        selected_commit: None,
+                        selection,
                         detail: None,
+                        search_query: String::new(),
+                        search_hits: Vec::new(),
+                        search_match_indices: std::collections::BTreeSet::new(),
                     });
                 }
                 Err(e) => self.error = Some(format!("Failed to list branches: {e}")),
@@ -77,18 +91,47 @@ impl App {
         }
     }
 
-    fn select_commit(&mut self, idx: usize) {
+    fn apply_selection_msg(&mut self, msg: SelectionMsg) {
         if let Some(repo) = &mut self.repo {
-            repo.selected_commit = Some(idx);
-            // Load detail lazily
-            let oid = &repo.commits[idx].id.0;
-            let changed_paths = repo.git.changed_paths(oid).unwrap_or_default();
-            let diff = repo.git.show_diff(oid).unwrap_or_default();
-            repo.detail = Some(CommitDetail {
-                _oid: oid.clone(),
-                changed_paths,
-                diff,
-            });
+            repo.selection = repo.selection.reduce(msg);
+            // Load detail for the last-clicked commit (if exactly one or the most recent click)
+            self.load_detail_for_focus();
+        }
+    }
+
+    fn load_detail_for_focus(&mut self) {
+        if let Some(repo) = &mut self.repo {
+            // Show detail for the single selected commit, or the last one if multiple.
+            let focus = if repo.selection.len() == 1 {
+                repo.selection.selected.iter().next().copied()
+            } else {
+                None
+            };
+
+            if let Some(idx) = focus {
+                let oid = &repo.commits[idx].id.0;
+                let changed_paths = repo.git.changed_paths(oid).unwrap_or_default();
+                let diff = repo.git.show_diff(oid).unwrap_or_default();
+                repo.detail = Some(CommitDetail {
+                    _oid: oid.clone(),
+                    changed_paths,
+                    diff,
+                });
+            } else {
+                repo.detail = None;
+            }
+        }
+    }
+
+    fn update_search(&mut self) {
+        if let Some(repo) = &mut self.repo {
+            if repo.search_query.is_empty() {
+                repo.search_hits.clear();
+                repo.search_match_indices.clear();
+            } else {
+                repo.search_hits = search_commits(&repo.commits, &repo.search_query);
+                repo.search_match_indices = search_hit_indices(&repo.search_hits);
+            }
         }
     }
 }
@@ -119,20 +162,71 @@ impl eframe::App for App {
                         });
                     if new_idx != repo.selected_branch {
                         repo.selected_branch = new_idx;
-                        repo.selected_commit = None;
+                        repo.selection = SelectionState::new(0);
                         repo.detail = None;
+                        repo.search_query.clear();
+                        repo.search_hits.clear();
+                        repo.search_match_indices.clear();
                         let branch_name = repo.branches[new_idx].name.clone();
                         match repo.git.walk_commits(&branch_name) {
-                            Ok(c) => repo.commits = c,
+                            Ok(c) => {
+                                repo.selection = SelectionState::new(c.len());
+                                repo.commits = c;
+                            }
                             Err(e) => self.error = Some(format!("Failed to read commits: {e}")),
                         }
                     }
 
                     ui.separator();
                     ui.label(format!("{} commits", repo.commits.len()));
+
+                    if !repo.selection.is_empty() {
+                        ui.separator();
+                        ui.label(format!("{} selected", repo.selection.len()));
+                    }
                 }
             });
         });
+
+        // Search bar (below toolbar)
+        if self.repo.is_some() {
+            let mut search_changed = false;
+            let mut select_all_results = false;
+
+            egui::TopBottomPanel::top("search_bar").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("🔍");
+                    let repo = self.repo.as_mut().unwrap();
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut repo.search_query)
+                            .hint_text("Search commits (message, author, path)…")
+                            .desired_width(300.0),
+                    );
+                    if response.changed() {
+                        search_changed = true;
+                    }
+                    if !repo.search_query.is_empty() {
+                        ui.label(format!("{} matches", repo.search_hits.len()));
+                        if ui.button("Select all results").clicked() && !repo.search_hits.is_empty()
+                        {
+                            select_all_results = true;
+                        }
+                        if ui.button("✕ Clear").clicked() {
+                            repo.search_query.clear();
+                            search_changed = true;
+                        }
+                    }
+                });
+            });
+
+            if search_changed {
+                self.update_search();
+            }
+            if select_all_results && let Some(repo) = &self.repo {
+                let indices = search_hit_indices(&repo.search_hits);
+                self.apply_selection_msg(SelectionMsg::SelectSet(indices));
+            }
+        }
 
         // Error banner
         if let Some(err) = &self.error {
@@ -154,15 +248,24 @@ impl eframe::App for App {
         }
 
         // Detail pane (right side)
-        let mut select_idx: Option<usize> = None;
+        let mut selection_msg: Option<SelectionMsg> = None;
 
         egui::SidePanel::right("detail_pane")
             .default_width(450.0)
             .show(ctx, |ui| {
                 if let Some(repo) = &self.repo {
-                    if let (Some(ci), Some(detail)) = (repo.selected_commit, &repo.detail) {
-                        let commit = &repo.commits[ci];
-                        render_detail(ui, commit, detail);
+                    if repo.selection.len() == 1 {
+                        let idx = *repo.selection.selected.iter().next().unwrap();
+                        let commit = &repo.commits[idx];
+                        if let Some(detail) = &repo.detail {
+                            render_detail(ui, commit, detail);
+                        }
+                    } else if repo.selection.len() > 1 {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(200.0);
+                            ui.heading(format!("{} commits selected", repo.selection.len()));
+                            ui.label("Bulk editing will be available in Phase 3.");
+                        });
                     } else {
                         ui.vertical_centered(|ui| {
                             ui.add_space(200.0);
@@ -175,28 +278,47 @@ impl eframe::App for App {
         // Commit list (main area)
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(repo) = &self.repo {
+                let searching = !repo.search_query.is_empty();
+
                 egui::ScrollArea::vertical()
                     .auto_shrink([false; 2])
                     .show(ui, |ui| {
                         for (i, commit) in repo.commits.iter().enumerate() {
-                            let selected = repo.selected_commit == Some(i);
-                            let response = render_commit_row(ui, commit, selected);
+                            let selected = repo.selection.is_selected(i);
+                            let is_search_match =
+                                searching && repo.search_match_indices.contains(&i);
+
+                            let response = render_commit_row(ui, commit, selected, is_search_match);
+
                             if response.clicked() {
-                                select_idx = Some(i);
+                                let modifiers = ui.input(|inp| inp.modifiers);
+                                let msg = if modifiers.ctrl || modifiers.command {
+                                    SelectionMsg::CtrlClick(i)
+                                } else if modifiers.shift {
+                                    SelectionMsg::ShiftClick(i)
+                                } else {
+                                    SelectionMsg::Click(i)
+                                };
+                                selection_msg = Some(msg);
                             }
                         }
                     });
             }
         });
 
-        if let Some(idx) = select_idx {
-            self.select_commit(idx);
+        if let Some(msg) = selection_msg {
+            self.apply_selection_msg(msg);
         }
     }
 }
 
 /// Render a single commit row in the list.
-fn render_commit_row(ui: &mut egui::Ui, commit: &Commit, selected: bool) -> egui::Response {
+fn render_commit_row(
+    ui: &mut egui::Ui,
+    commit: &Commit,
+    selected: bool,
+    is_search_match: bool,
+) -> egui::Response {
     let merge_marker = if commit.is_merge() { "⑂ " } else { "" };
     let short_sha = commit.id.short();
     let author = &commit.author.name;
@@ -207,7 +329,13 @@ fn render_commit_row(ui: &mut egui::Ui, commit: &Commit, selected: bool) -> egui
         commit.summary
     );
 
-    let label = egui::SelectableLabel::new(selected, egui::RichText::new(&text).monospace());
+    let mut rich_text = egui::RichText::new(&text).monospace();
+    if is_search_match && !selected {
+        rich_text =
+            rich_text.background_color(egui::Color32::from_rgba_premultiplied(80, 80, 0, 40));
+    }
+
+    let label = egui::SelectableLabel::new(selected, rich_text);
     ui.add(label)
 }
 
