@@ -1,4 +1,7 @@
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
+use std::time::Duration;
 
 use eframe::egui;
 use gunk_core::{
@@ -11,6 +14,8 @@ use gunk_gitio::{
     list_backup_refs, restore_backup,
 };
 use std::collections::HashMap;
+
+const COMMIT_PAGE_SIZE: usize = 500;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -34,6 +39,7 @@ struct RepoState {
     branches: Vec<BranchInfo>,
     selected_branch: usize,
     commits: Vec<Commit>,
+    has_more_commits: bool,
     /// Commit selection (multi-select via Ctrl/Shift).
     selection: SelectionState,
     /// Lazily loaded detail for the focused commit (last clicked).
@@ -80,11 +86,64 @@ struct CommitDetail {
     diff: String,
 }
 
+enum PendingLoadKind {
+    OpenRepo,
+    SwitchBranch { new_idx: usize },
+}
+
+struct PendingLoad {
+    request_id: u64,
+    kind: PendingLoadKind,
+    message: String,
+}
+
+struct RepoLoadSnapshot {
+    git: Git,
+    branches: Vec<BranchInfo>,
+    commits: Vec<Commit>,
+    has_more_commits: bool,
+    filter_repo_available: bool,
+}
+
+enum LoadOutcome {
+    OpenRepo(RepoLoadSnapshot),
+    SwitchBranch {
+        new_idx: usize,
+        commits: Vec<Commit>,
+        has_more_commits: bool,
+    },
+}
+
+struct LoadResponse {
+    request_id: u64,
+    result: Result<LoadOutcome, String>,
+}
+
 /// Top-level app state.
 #[derive(Default)]
 struct App {
     repo: Option<RepoState>,
     error: Option<String>,
+    load_rx: Option<Receiver<LoadResponse>>,
+    pending_load: Option<PendingLoad>,
+    next_request_id: u64,
+}
+
+fn read_commit_window(
+    git: &Git,
+    branch: &str,
+    desired_count: usize,
+) -> Result<(Vec<Commit>, bool), gunk_gitio::GitError> {
+    let page = git.walk_commits_page(branch, 0, desired_count.max(COMMIT_PAGE_SIZE))?;
+    Ok((page.commits, page.has_more))
+}
+
+fn commit_count_label(loaded_count: usize, has_more: bool) -> String {
+    if has_more {
+        format!("{loaded_count}+ commits loaded")
+    } else {
+        format!("{loaded_count} commits")
+    }
 }
 
 // ── Logic (no UI) ──────────────────────────────────────────────────
@@ -92,50 +151,167 @@ struct App {
 impl App {
     fn open_repo(&mut self, path: PathBuf) {
         self.error = None;
-        match Git::open(&path) {
-            Ok(git) => match git.list_branches() {
-                Ok(branches) if branches.is_empty() => {
-                    self.error = Some("Repository has no branches.".into());
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.saturating_add(1);
+        let message = format!("Loading repository: {}", path.display());
+
+        let (tx, rx) = mpsc::channel();
+        self.load_rx = Some(rx);
+        self.pending_load = Some(PendingLoad {
+            request_id,
+            kind: PendingLoadKind::OpenRepo,
+            message,
+        });
+
+        thread::spawn(move || {
+            let result = (|| -> Result<LoadOutcome, String> {
+                let git = Git::open(&path).map_err(|e| format!("Failed to open repo: {e}"))?;
+                let branches = git
+                    .list_branches()
+                    .map_err(|e| format!("Failed to list branches: {e}"))?;
+                if branches.is_empty() {
+                    return Err("Repository has no branches.".to_string());
                 }
-                Ok(branches) => {
-                    let commits = match git.walk_commits(&branches[0].name) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            self.error = Some(format!("Failed to read commits: {e}"));
-                            return;
-                        }
-                    };
-                    let selection = SelectionState::new(commits.len());
-                    let filter_repo_available = has_filter_repo(&git);
-                    self.repo = Some(RepoState {
-                        git,
-                        branches,
-                        selected_branch: 0,
-                        commits,
-                        selection,
-                        detail: None,
-                        search_query: String::new(),
-                        search_hits: Vec::new(),
-                        search_match_indices: std::collections::BTreeSet::new(),
-                        draft: DraftState::new(),
-                        preview_rows: Vec::new(),
-                        plan_error: None,
-                        reword_summary: String::new(),
-                        reword_body: String::new(),
-                        author_name: String::new(),
-                        author_email: String::new(),
-                        show_confirm_dialog: false,
-                        execute_result: None,
-                        show_restore_panel: false,
-                        backup_refs: Vec::new(),
-                        filter_repo_available,
-                        files_selected_for_removal: std::collections::BTreeSet::new(),
-                        add_to_gitignore: false,
-                    });
+
+                let (commits, has_more_commits) =
+                    read_commit_window(&git, &branches[0].name, COMMIT_PAGE_SIZE)
+                        .map_err(|e| format!("Failed to read commits: {e}"))?;
+
+                Ok(LoadOutcome::OpenRepo(RepoLoadSnapshot {
+                    filter_repo_available: has_filter_repo(&git),
+                    git,
+                    branches,
+                    commits,
+                    has_more_commits,
+                }))
+            })();
+
+            let _ = tx.send(LoadResponse { request_id, result });
+        });
+    }
+
+    fn start_branch_switch_load(&mut self, new_idx: usize) {
+        let Some(repo) = &self.repo else { return };
+        if new_idx == repo.selected_branch {
+            return;
+        }
+
+        let git = repo.git.clone();
+        let branch_name = repo.branches[new_idx].name.clone();
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.saturating_add(1);
+
+        let (tx, rx) = mpsc::channel();
+        self.load_rx = Some(rx);
+        self.pending_load = Some(PendingLoad {
+            request_id,
+            kind: PendingLoadKind::SwitchBranch { new_idx },
+            message: format!("Loading branch: {branch_name}"),
+        });
+
+        thread::spawn(move || {
+            let result = read_commit_window(&git, &branch_name, COMMIT_PAGE_SIZE)
+                .map(|(commits, has_more_commits)| LoadOutcome::SwitchBranch {
+                    new_idx,
+                    commits,
+                    has_more_commits,
+                })
+                .map_err(|e| format!("Failed to read commits: {e}"));
+
+            let _ = tx.send(LoadResponse { request_id, result });
+        });
+    }
+
+    fn poll_background_load(&mut self) {
+        let response = {
+            let Some(rx) = &self.load_rx else { return };
+            match rx.try_recv() {
+                Ok(r) => Some(r),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => {
+                    self.load_rx = None;
+                    self.pending_load = None;
+                    self.error = Some("Background loading failed unexpectedly.".to_string());
+                    None
                 }
-                Err(e) => self.error = Some(format!("Failed to list branches: {e}")),
-            },
-            Err(e) => self.error = Some(format!("Failed to open repo: {e}")),
+            }
+        };
+
+        let Some(response) = response else { return };
+
+        let Some(pending) = self.pending_load.take() else {
+            return;
+        };
+        if pending.request_id != response.request_id {
+            return;
+        }
+        self.load_rx = None;
+
+        match (pending.kind, response.result) {
+            (_, Err(err)) => {
+                self.error = Some(err);
+            }
+            (PendingLoadKind::OpenRepo, Ok(LoadOutcome::OpenRepo(snapshot))) => {
+                let selection = SelectionState::new(snapshot.commits.len());
+                self.repo = Some(RepoState {
+                    git: snapshot.git,
+                    branches: snapshot.branches,
+                    selected_branch: 0,
+                    commits: snapshot.commits,
+                    has_more_commits: snapshot.has_more_commits,
+                    selection,
+                    detail: None,
+                    search_query: String::new(),
+                    search_hits: Vec::new(),
+                    search_match_indices: std::collections::BTreeSet::new(),
+                    draft: DraftState::new(),
+                    preview_rows: Vec::new(),
+                    plan_error: None,
+                    reword_summary: String::new(),
+                    reword_body: String::new(),
+                    author_name: String::new(),
+                    author_email: String::new(),
+                    show_confirm_dialog: false,
+                    execute_result: None,
+                    show_restore_panel: false,
+                    backup_refs: Vec::new(),
+                    filter_repo_available: snapshot.filter_repo_available,
+                    files_selected_for_removal: std::collections::BTreeSet::new(),
+                    add_to_gitignore: false,
+                });
+            }
+            (
+                PendingLoadKind::SwitchBranch {
+                    new_idx: expected_idx,
+                },
+                Ok(LoadOutcome::SwitchBranch {
+                    new_idx,
+                    commits,
+                    has_more_commits,
+                }),
+            ) => {
+                if expected_idx != new_idx {
+                    self.error =
+                        Some("Background branch load result was inconsistent.".to_string());
+                    return;
+                }
+                if let Some(repo) = &mut self.repo {
+                    repo.selected_branch = new_idx;
+                    repo.selection = SelectionState::new(commits.len());
+                    repo.commits = commits;
+                    repo.has_more_commits = has_more_commits;
+                    repo.detail = None;
+                    repo.search_query.clear();
+                    repo.search_hits.clear();
+                    repo.search_match_indices.clear();
+                    repo.draft = DraftState::new();
+                    repo.preview_rows.clear();
+                    repo.plan_error = None;
+                }
+            }
+            _ => {
+                self.error = Some("Background load result did not match request type.".to_string());
+            }
         }
     }
 
@@ -208,6 +384,44 @@ impl App {
                     repo.plan_error = Some(format!("{e}"));
                 }
             }
+        }
+    }
+
+    fn load_more_commits(&mut self) {
+        let mut load_error = None;
+        let mut refresh_search = false;
+        let mut refresh_preview = false;
+
+        if let Some(repo) = &mut self.repo {
+            if !repo.has_more_commits {
+                return;
+            }
+
+            let branch_name = repo.branches[repo.selected_branch].name.clone();
+            let loaded_count = repo.commits.len();
+            match repo
+                .git
+                .walk_commits_page(&branch_name, loaded_count, COMMIT_PAGE_SIZE)
+            {
+                Ok(page) => {
+                    repo.commits.extend(page.commits);
+                    repo.has_more_commits = page.has_more;
+                    repo.selection.count = repo.commits.len();
+                    refresh_search = !repo.search_query.is_empty();
+                    refresh_preview = !repo.draft.is_empty();
+                }
+                Err(e) => load_error = Some(format!("Failed to load more commits: {e}")),
+            }
+        }
+
+        if let Some(err) = load_error {
+            self.error = Some(err);
+        }
+        if refresh_search {
+            self.update_search();
+        }
+        if refresh_preview {
+            self.recompute_preview();
         }
     }
 
@@ -288,7 +502,10 @@ impl App {
                         }
                         // Re-snapshot after flatten (OIDs changed).
                         match repo.git.walk_commits(&branch) {
-                            Ok(c) => repo.commits = c,
+                            Ok(c) => {
+                                repo.has_more_commits = false;
+                                repo.commits = c;
+                            }
                             Err(e) => {
                                 repo.execute_result =
                                     Some(Err(format!("Failed to reload after flatten: {e}")));
@@ -324,7 +541,10 @@ impl App {
                         }
                         // Re-snapshot after filter-repo (OIDs changed).
                         match repo.git.walk_commits(&branch) {
-                            Ok(c) => repo.commits = c,
+                            Ok(c) => {
+                                repo.has_more_commits = false;
+                                repo.commits = c;
+                            }
                             Err(e) => {
                                 repo.execute_result =
                                     Some(Err(format!("Failed to reload after filter-repo: {e}")));
@@ -368,7 +588,6 @@ impl App {
         repo.draft = DraftState::new();
         repo.preview_rows.clear();
         repo.plan_error = None;
-        repo.selection = SelectionState::new(0);
         repo.detail = None;
         repo.search_query.clear();
         repo.search_hits.clear();
@@ -379,12 +598,16 @@ impl App {
         repo.author_email.clear();
         repo.files_selected_for_removal.clear();
         repo.add_to_gitignore = false;
-        match repo.git.walk_commits(&branch) {
-            Ok(c) => {
-                repo.selection = SelectionState::new(c.len());
-                repo.commits = c;
+        match read_commit_window(&repo.git, &branch, repo.commits.len()) {
+            Ok((commits, has_more_commits)) => {
+                repo.selection = SelectionState::new(commits.len());
+                repo.commits = commits;
+                repo.has_more_commits = has_more_commits;
             }
             Err(e) => {
+                repo.selection = SelectionState::new(0);
+                repo.commits.clear();
+                repo.has_more_commits = false;
                 self.error = Some(format!("Failed to reload commits: {e}"));
             }
         }
@@ -412,15 +635,20 @@ impl App {
                 repo.draft = DraftState::new();
                 repo.preview_rows.clear();
                 repo.plan_error = None;
-                repo.selection = SelectionState::new(0);
                 repo.detail = None;
                 repo.execute_result = None;
-                match repo.git.walk_commits(&branch) {
-                    Ok(c) => {
-                        repo.selection = SelectionState::new(c.len());
-                        repo.commits = c;
+                match read_commit_window(&repo.git, &branch, repo.commits.len()) {
+                    Ok((commits, has_more_commits)) => {
+                        repo.selection = SelectionState::new(commits.len());
+                        repo.commits = commits;
+                        repo.has_more_commits = has_more_commits;
                     }
-                    Err(e) => self.error = Some(format!("Failed to reload commits: {e}")),
+                    Err(e) => {
+                        repo.selection = SelectionState::new(0);
+                        repo.commits.clear();
+                        repo.has_more_commits = false;
+                        self.error = Some(format!("Failed to reload commits: {e}"));
+                    }
                 }
             }
             Err(e) => self.error = Some(format!("Restore failed: {e}")),
@@ -432,48 +660,58 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_background_load();
+        if self.pending_load.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+
+        let mut request_load_more = false;
+        let mut request_open_repo: Option<PathBuf> = None;
+        let mut request_switch_branch: Option<usize> = None;
+        let is_loading = self.pending_load.is_some();
+
         // Top bar
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("📂 Open Repository").clicked()
+                if ui
+                    .add_enabled(!is_loading, egui::Button::new("📂 Open Repository"))
+                    .clicked()
                     && let Some(path) = rfd::FileDialog::new().pick_folder()
                 {
-                    self.open_repo(path);
+                    request_open_repo = Some(path);
                 }
 
                 if let Some(repo) = &mut self.repo {
                     ui.separator();
                     let current = repo.branches[repo.selected_branch].name.clone();
                     let mut new_idx = repo.selected_branch;
-                    egui::ComboBox::from_label("Branch")
-                        .selected_text(&current)
-                        .show_ui(ui, |ui| {
-                            for (i, b) in repo.branches.iter().enumerate() {
-                                ui.selectable_value(&mut new_idx, i, &b.name);
-                            }
-                        });
-                    if new_idx != repo.selected_branch {
-                        repo.selected_branch = new_idx;
-                        repo.selection = SelectionState::new(0);
-                        repo.detail = None;
-                        repo.search_query.clear();
-                        repo.search_hits.clear();
-                        repo.search_match_indices.clear();
-                        repo.draft = DraftState::new();
-                        repo.preview_rows.clear();
-                        repo.plan_error = None;
-                        let branch_name = repo.branches[new_idx].name.clone();
-                        match repo.git.walk_commits(&branch_name) {
-                            Ok(c) => {
-                                repo.selection = SelectionState::new(c.len());
-                                repo.commits = c;
-                            }
-                            Err(e) => self.error = Some(format!("Failed to read commits: {e}")),
-                        }
+                    ui.add_enabled_ui(!is_loading, |ui| {
+                        egui::ComboBox::from_label("Branch")
+                            .selected_text(&current)
+                            .show_ui(ui, |ui| {
+                                for (i, b) in repo.branches.iter().enumerate() {
+                                    ui.selectable_value(&mut new_idx, i, &b.name);
+                                }
+                            });
+                    });
+                    if !is_loading && new_idx != repo.selected_branch {
+                        request_switch_branch = Some(new_idx);
                     }
 
                     ui.separator();
-                    ui.label(format!("{} commits", repo.commits.len()));
+                    ui.label(commit_count_label(
+                        repo.commits.len(),
+                        repo.has_more_commits,
+                    ));
+
+                    if repo.has_more_commits
+                        && !is_loading
+                        && ui
+                            .button(format!("Load {} more", COMMIT_PAGE_SIZE))
+                            .clicked()
+                    {
+                        request_load_more = true;
+                    }
 
                     if !repo.selection.is_empty() {
                         ui.separator();
@@ -482,6 +720,23 @@ impl eframe::App for App {
                 }
             });
         });
+
+        if let Some(path) = request_open_repo {
+            self.open_repo(path);
+        }
+        if let Some(new_idx) = request_switch_branch {
+            self.start_branch_switch_load(new_idx);
+            request_load_more = false;
+        }
+
+        if let Some(pending) = &self.pending_load {
+            egui::TopBottomPanel::top("loading_banner").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(&pending.message);
+                });
+            });
+        }
 
         // Search bar (below toolbar)
         if self.repo.is_some() {
@@ -536,7 +791,13 @@ impl eframe::App for App {
                 ui.vertical_centered(|ui| {
                     ui.add_space(200.0);
                     ui.heading("gunk");
-                    ui.label("Open a Git repository to get started.");
+                    if let Some(pending) = &self.pending_load {
+                        ui.add_space(8.0);
+                        ui.spinner();
+                        ui.label(&pending.message);
+                    } else {
+                        ui.label("Open a Git repository to get started.");
+                    }
                 });
             });
             return;
@@ -949,29 +1210,37 @@ impl eframe::App for App {
 
                 egui::ScrollArea::vertical()
                     .auto_shrink([false; 2])
-                    .show(ui, |ui| {
-                        for (i, prow) in order {
-                            let commit = &repo.commits[i];
-                            let selected = repo.selection.is_selected(i);
-                            let is_search_match =
-                                searching && repo.search_match_indices.contains(&i);
+                    .show_rows(
+                        ui,
+                        ui.text_style_height(&egui::TextStyle::Monospace)
+                            .max(ui.spacing().interact_size.y)
+                            + 4.0,
+                        order.len(),
+                        |ui, row_range| {
+                            for row_index in row_range {
+                                let (i, prow) = order[row_index];
+                                let commit = &repo.commits[i];
+                                let selected = repo.selection.is_selected(i);
+                                let is_search_match =
+                                    searching && repo.search_match_indices.contains(&i);
 
-                            let response =
-                                render_commit_row(ui, commit, selected, is_search_match, prow);
+                                let response =
+                                    render_commit_row(ui, commit, selected, is_search_match, prow);
 
-                            if response.clicked() {
-                                let modifiers = ui.input(|inp| inp.modifiers);
-                                let msg = if modifiers.ctrl || modifiers.command {
-                                    SelectionMsg::CtrlClick(i)
-                                } else if modifiers.shift {
-                                    SelectionMsg::ShiftClick(i)
-                                } else {
-                                    SelectionMsg::Click(i)
-                                };
-                                selection_msg = Some(msg);
+                                if response.clicked() {
+                                    let modifiers = ui.input(|inp| inp.modifiers);
+                                    let msg = if modifiers.ctrl || modifiers.command {
+                                        SelectionMsg::CtrlClick(i)
+                                    } else if modifiers.shift {
+                                        SelectionMsg::ShiftClick(i)
+                                    } else {
+                                        SelectionMsg::Click(i)
+                                    };
+                                    selection_msg = Some(msg);
+                                }
                             }
-                        }
-                    });
+                        },
+                    );
             }
         });
 
@@ -989,6 +1258,9 @@ impl eframe::App for App {
             if let Some(repo) = &mut self.repo {
                 repo.show_restore_panel = true;
             }
+        }
+        if request_load_more && self.pending_load.is_none() {
+            self.load_more_commits();
         }
         if let Some(msg) = draft_msg {
             self.apply_draft_msg(msg);
@@ -1170,4 +1442,15 @@ fn format_relative_date(time: time::OffsetDateTime) -> String {
     }
     let years = days / 365;
     format!("{years} years ago")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::commit_count_label;
+
+    #[test]
+    fn commit_count_label_indicates_when_history_is_partial() {
+        assert_eq!(commit_count_label(500, true), "500+ commits loaded");
+        assert_eq!(commit_count_label(500, false), "500 commits");
+    }
 }
