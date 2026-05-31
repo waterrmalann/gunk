@@ -366,6 +366,17 @@ fn fixup_adjacent() {
 }
 
 #[test]
+fn fixup_non_adjacent_auto_reorder() {
+    let snap = linear_snapshot();
+    let ops = vec![Operation::Fixup {
+        keep: cid("B"),
+        absorb: vec![cid("D")],
+    }];
+    let result = plan(&snap, &ops).unwrap();
+    insta::assert_yaml_snapshot!(result);
+}
+
+#[test]
 fn drop_single_commit() {
     let snap = linear_snapshot();
     let ops = vec![Operation::Drop { target: cid("C") }];
@@ -758,9 +769,37 @@ mod prop {
                     _ => None,
                 }).collect();
                 prop_assert_eq!(pick_ids.len(), 5);
+                // The todo (oldest-first) must be the reverse of the requested
+                // newest-first order — not merely some permutation. This catches
+                // a builder that ignores `new_order`.
+                let expected: Vec<&CommitId> = perm.iter().rev().collect();
+                prop_assert_eq!(pick_ids, expected);
             } else {
                 prop_assert!(false, "expected Rebase plan");
             }
+        }
+
+        /// Plan generation must be order-independent: the same set of
+        /// non-conflicting operations, in any order, yields the same plan.
+        #[test]
+        fn arbitrary_order_independence(order in Just((0..3usize).collect::<Vec<_>>()).prop_shuffle()) {
+            let snap = arb_linear_snapshot(5);
+            // Three non-conflicting ops on distinct commits.
+            let make = |which: usize| match which {
+                0 => Operation::Reword {
+                    target: snap[1].id.clone(),
+                    summary: "new".into(),
+                    body: String::new(),
+                },
+                1 => Operation::SetAuthor {
+                    targets: vec![snap[2].id.clone()],
+                    author: test_identity("Bob"),
+                },
+                _ => Operation::Drop { target: snap[3].id.clone() },
+            };
+            let canonical: Vec<Operation> = (0..3).map(make).collect();
+            let shuffled: Vec<Operation> = order.iter().map(|&w| make(w)).collect();
+            prop_assert_eq!(plan(&snap, &canonical).unwrap(), plan(&snap, &shuffled).unwrap());
         }
 
         #[test]

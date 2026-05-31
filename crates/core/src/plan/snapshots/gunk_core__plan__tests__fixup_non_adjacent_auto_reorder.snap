@@ -1,6 +1,5 @@
 ---
 source: crates/core/src/plan/tests.rs
-assertion_line: 859
 expression: result
 ---
 Rebase:
@@ -8,10 +7,8 @@ Rebase:
   lines:
     - Pick: A
     - Pick: B
-    - Reword: C
-    - Pick: D
+    - Fixup: D
+    - Pick: C
     - Pick: E
-  message_map:
-    - - C
-      - "Refactored C\n\nDetailed description"
+  message_map: []
   author_map: []

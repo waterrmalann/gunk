@@ -1,4 +1,4 @@
-use gunk_core::{ChangeStatus, Commit};
+use gunk_core::ChangeStatus;
 use gunk_gitio::Git;
 use gunk_testkit::RepoFixture;
 
@@ -202,6 +202,32 @@ fn walk_empty_body() {
     assert_eq!(commits.len(), 1);
     assert_eq!(commits[0].summary, "no body");
     assert!(commits[0].body.is_empty());
+}
+
+#[test]
+fn walk_multiline_body_preserves_paragraphs() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit(
+        "c1",
+        "Subject line\n\nFirst body paragraph.\n\nSecond paragraph with detail.",
+        &[("f.txt", "x")],
+    );
+
+    let git = Git::open(fixture.path()).unwrap();
+    let commits = git.walk_commits("main").unwrap();
+
+    assert_eq!(commits.len(), 1);
+    // The summary must stop at the first line; the body must retain the
+    // blank-line-separated paragraphs intact (NUL/record parsing must not
+    // truncate the multi-line body).
+    assert_eq!(commits[0].summary, "Subject line");
+    assert!(commits[0].body.contains("First body paragraph."));
+    assert!(commits[0].body.contains("Second paragraph with detail."));
+    assert!(
+        commits[0].body.contains("\n\n"),
+        "blank line between paragraphs should survive, got: {:?}",
+        commits[0].body
+    );
 }
 
 #[test]
