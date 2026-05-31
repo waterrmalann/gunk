@@ -2,10 +2,12 @@ use std::path::PathBuf;
 
 use eframe::egui;
 use gunk_core::{
-    ChangeStatus, Commit, PathChange, SearchHit, SelectionMsg, SelectionState, search_commits,
+    ChangeStatus, Commit, CommitId, DraftMsg, DraftState, Identity, PathChange, PreviewRow,
+    RowStatus, SearchHit, SelectionMsg, SelectionState, preview, search_commits,
     search_hit_indices,
 };
 use gunk_gitio::{BranchInfo, Git};
+use std::collections::HashMap;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -39,6 +41,20 @@ struct RepoState {
     search_hits: Vec<SearchHit>,
     /// Indices of commits matching the current search (for fast lookup).
     search_match_indices: std::collections::BTreeSet<usize>,
+    /// Pending draft operations (nothing applied to the real repo).
+    draft: DraftState,
+    /// Projected preview rows for the current draft (display order, newest-first).
+    preview_rows: Vec<PreviewRow>,
+    /// Validation error from the plan engine for the current draft, if any.
+    plan_error: Option<String>,
+    /// Edit buffer for the reword summary (single-select detail pane).
+    reword_summary: String,
+    /// Edit buffer for the reword body.
+    reword_body: String,
+    /// Edit buffer for the author name (set-author).
+    author_name: String,
+    /// Edit buffer for the author email (set-author).
+    author_email: String,
 }
 
 struct CommitDetail {
@@ -83,6 +99,13 @@ impl App {
                         search_query: String::new(),
                         search_hits: Vec::new(),
                         search_match_indices: std::collections::BTreeSet::new(),
+                        draft: DraftState::new(),
+                        preview_rows: Vec::new(),
+                        plan_error: None,
+                        reword_summary: String::new(),
+                        reword_body: String::new(),
+                        author_name: String::new(),
+                        author_email: String::new(),
                     });
                 }
                 Err(e) => self.error = Some(format!("Failed to list branches: {e}")),
@@ -100,6 +123,7 @@ impl App {
     }
 
     fn load_detail_for_focus(&mut self) {
+        let mut load_error = None;
         if let Some(repo) = &mut self.repo {
             // Show detail for the single selected commit, or the last one if multiple.
             let focus = if repo.selection.len() == 1 {
@@ -109,16 +133,55 @@ impl App {
             };
 
             if let Some(idx) = focus {
-                let oid = &repo.commits[idx].id.0;
-                let changed_paths = repo.git.changed_paths(oid).unwrap_or_default();
-                let diff = repo.git.show_diff(oid).unwrap_or_default();
-                repo.detail = Some(CommitDetail {
-                    _oid: oid.clone(),
-                    changed_paths,
-                    diff,
-                });
+                let oid = repo.commits[idx].id.0.clone();
+                match (repo.git.changed_paths(&oid), repo.git.show_diff(&oid)) {
+                    (Ok(changed_paths), Ok(diff)) => {
+                        repo.detail = Some(CommitDetail {
+                            _oid: oid,
+                            changed_paths,
+                            diff,
+                        });
+                    }
+                    (Err(e), _) | (_, Err(e)) => {
+                        repo.detail = None;
+                        load_error = Some(format!("Failed to load commit detail: {e}"));
+                    }
+                }
             } else {
                 repo.detail = None;
+            }
+        }
+        if load_error.is_some() {
+            self.error = load_error;
+        }
+    }
+
+    fn apply_draft_msg(&mut self, msg: DraftMsg) {
+        if let Some(repo) = &mut self.repo {
+            repo.draft = repo.draft.reduce(msg);
+        }
+        self.recompute_preview();
+    }
+
+    /// Recompute the projected preview from the current draft.
+    ///
+    /// Stores the rows on success, or the plan-engine error string on failure
+    /// (leaving the previous rows in place so the list does not flicker empty).
+    fn recompute_preview(&mut self) {
+        if let Some(repo) = &mut self.repo {
+            if repo.draft.is_empty() {
+                repo.preview_rows.clear();
+                repo.plan_error = None;
+                return;
+            }
+            match preview(&repo.commits, &repo.draft.ops) {
+                Ok(rows) => {
+                    repo.preview_rows = rows;
+                    repo.plan_error = None;
+                }
+                Err(e) => {
+                    repo.plan_error = Some(format!("{e}"));
+                }
             }
         }
     }
@@ -167,6 +230,9 @@ impl eframe::App for App {
                         repo.search_query.clear();
                         repo.search_hits.clear();
                         repo.search_match_indices.clear();
+                        repo.draft = DraftState::new();
+                        repo.preview_rows.clear();
+                        repo.plan_error = None;
                         let branch_name = repo.branches[new_idx].name.clone();
                         match repo.git.walk_commits(&branch_name) {
                             Ok(c) => {
@@ -249,22 +315,147 @@ impl eframe::App for App {
 
         // Detail pane (right side)
         let mut selection_msg: Option<SelectionMsg> = None;
+        let mut draft_msg: Option<DraftMsg> = None;
+        let mut recompute_preview = false;
 
         egui::SidePanel::right("detail_pane")
             .default_width(450.0)
             .show(ctx, |ui| {
-                if let Some(repo) = &self.repo {
-                    if repo.selection.len() == 1 {
+                if let Some(repo) = &mut self.repo {
+                    let sel_len = repo.selection.len();
+                    if sel_len == 1 {
                         let idx = *repo.selection.selected.iter().next().unwrap();
+                        let id = repo.commits[idx].id.clone();
+                        let is_dropped = repo
+                            .draft
+                            .ops
+                            .iter()
+                            .any(|op| matches!(op, gunk_core::Operation::Drop { target } if *target == id));
+
+                        // Edit controls for the single focused commit.
+                        ui.horizontal(|ui| {
+                            let label = if is_dropped { "↺ Undrop" } else { "🗑 Drop" };
+                            if ui.button(label).clicked() {
+                                draft_msg = Some(DraftMsg::ToggleDrop(id.clone()));
+                            }
+                        });
+                        ui.collapsing("Reword", |ui| {
+                            ui.label("Summary");
+                            ui.text_edit_singleline(&mut repo.reword_summary);
+                            ui.label("Body");
+                            ui.text_edit_multiline(&mut repo.reword_body);
+                            if ui.button("Apply reword").clicked()
+                                && !repo.reword_summary.trim().is_empty()
+                            {
+                                draft_msg = Some(DraftMsg::Reword {
+                                    target: id.clone(),
+                                    summary: repo.reword_summary.clone(),
+                                    body: repo.reword_body.clone(),
+                                });
+                            }
+                        });
+                        ui.collapsing("Set author", |ui| {
+                            ui.label("Name");
+                            ui.text_edit_singleline(&mut repo.author_name);
+                            ui.label("Email");
+                            ui.text_edit_singleline(&mut repo.author_email);
+                            if ui.button("Apply author").clicked()
+                                && !repo.author_name.trim().is_empty()
+                            {
+                                draft_msg = Some(DraftMsg::SetAuthor {
+                                    targets: vec![id.clone()],
+                                    author: Identity {
+                                        name: repo.author_name.clone(),
+                                        email: repo.author_email.clone(),
+                                        time: time::OffsetDateTime::now_utc(),
+                                    },
+                                });
+                            }
+                        });
+                        ui.separator();
+
                         let commit = &repo.commits[idx];
                         if let Some(detail) = &repo.detail {
                             render_detail(ui, commit, detail);
                         }
-                    } else if repo.selection.len() > 1 {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(200.0);
-                            ui.heading(format!("{} commits selected", repo.selection.len()));
-                            ui.label("Bulk editing will be available in Phase 3.");
+                    } else if sel_len > 1 {
+                        // Bulk actions over the selected set. The oldest commit
+                        // (largest index, since the list is newest-first) is the
+                        // squash/fixup keep target.
+                        let targets: Vec<CommitId> = repo
+                            .selection
+                            .selected
+                            .iter()
+                            .map(|&i| repo.commits[i].id.clone())
+                            .collect();
+                        let keep = repo.commits[*repo.selection.selected.iter().next_back().unwrap()]
+                            .id
+                            .clone();
+                        let absorb: Vec<CommitId> =
+                            targets.iter().filter(|t| **t != keep).cloned().collect();
+
+                        ui.heading(format!("{sel_len} commits selected"));
+                        ui.separator();
+
+                        if ui.button("🗑 Drop all").clicked() {
+                            // Drop is a per-commit toggle; add a drop for each
+                            // target that is not already dropped.
+                            for t in &targets {
+                                let already = repo.draft.ops.iter().any(|op| {
+                                    matches!(op, gunk_core::Operation::Drop { target } if target == t)
+                                });
+                                if !already {
+                                    repo.draft = repo.draft.reduce(DraftMsg::ToggleDrop(t.clone()));
+                                }
+                            }
+                            recompute_preview = true;
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("⬇ Squash into oldest").clicked() {
+                                draft_msg = Some(DraftMsg::Squash {
+                                    keep: keep.clone(),
+                                    absorb: absorb.clone(),
+                                });
+                            }
+                            if ui.button("⬇ Fixup into oldest").clicked() {
+                                draft_msg = Some(DraftMsg::Fixup {
+                                    keep: keep.clone(),
+                                    absorb: absorb.clone(),
+                                });
+                            }
+                        });
+                        ui.collapsing("Set message (all)", |ui| {
+                            ui.label("Summary");
+                            ui.text_edit_singleline(&mut repo.reword_summary);
+                            ui.label("Body");
+                            ui.text_edit_multiline(&mut repo.reword_body);
+                            if ui.button("Apply message").clicked()
+                                && !repo.reword_summary.trim().is_empty()
+                            {
+                                draft_msg = Some(DraftMsg::SetMessage {
+                                    targets: targets.clone(),
+                                    summary: repo.reword_summary.clone(),
+                                    body: repo.reword_body.clone(),
+                                });
+                            }
+                        });
+                        ui.collapsing("Set author (all)", |ui| {
+                            ui.label("Name");
+                            ui.text_edit_singleline(&mut repo.author_name);
+                            ui.label("Email");
+                            ui.text_edit_singleline(&mut repo.author_email);
+                            if ui.button("Apply author").clicked()
+                                && !repo.author_name.trim().is_empty()
+                            {
+                                draft_msg = Some(DraftMsg::SetAuthor {
+                                    targets: targets.clone(),
+                                    author: Identity {
+                                        name: repo.author_name.clone(),
+                                        email: repo.author_email.clone(),
+                                        time: time::OffsetDateTime::now_utc(),
+                                    },
+                                });
+                            }
                         });
                     } else {
                         ui.vertical_centered(|ui| {
@@ -275,20 +466,60 @@ impl eframe::App for App {
                 }
             });
 
+        // Bottom draft bar
+        let mut clear_draft = false;
+        if let Some(repo) = &self.repo
+            && (!repo.draft.is_empty() || repo.plan_error.is_some())
+        {
+            egui::TopBottomPanel::bottom("draft_bar").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{} draft operation(s)", repo.draft.len()));
+                    if ui.button("Discard all drafts").clicked() {
+                        clear_draft = true;
+                    }
+                    if let Some(err) = &repo.plan_error {
+                        ui.separator();
+                        ui.colored_label(egui::Color32::RED, format!("⚠ invalid draft: {err}"));
+                    }
+                });
+            });
+        }
+
         // Commit list (main area)
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(repo) = &self.repo {
                 let searching = !repo.search_query.is_empty();
 
+                // Original index of each commit, for selection/search lookups.
+                let index_by_id: HashMap<&CommitId, usize> = repo
+                    .commits
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (&c.id, i))
+                    .collect();
+
+                // Iterate in projected order when a draft has produced preview
+                // rows (reorder-aware); otherwise use the original commit order.
+                let order: Vec<(usize, Option<&PreviewRow>)> = if repo.preview_rows.is_empty() {
+                    (0..repo.commits.len()).map(|i| (i, None)).collect()
+                } else {
+                    repo.preview_rows
+                        .iter()
+                        .map(|r| (index_by_id[&r.id], Some(r)))
+                        .collect()
+                };
+
                 egui::ScrollArea::vertical()
                     .auto_shrink([false; 2])
                     .show(ui, |ui| {
-                        for (i, commit) in repo.commits.iter().enumerate() {
+                        for (i, prow) in order {
+                            let commit = &repo.commits[i];
                             let selected = repo.selection.is_selected(i);
                             let is_search_match =
                                 searching && repo.search_match_indices.contains(&i);
 
-                            let response = render_commit_row(ui, commit, selected, is_search_match);
+                            let response =
+                                render_commit_row(ui, commit, selected, is_search_match, prow);
 
                             if response.clicked() {
                                 let modifiers = ui.input(|inp| inp.modifiers);
@@ -306,6 +537,14 @@ impl eframe::App for App {
             }
         });
 
+        if clear_draft {
+            self.apply_draft_msg(DraftMsg::Clear);
+        }
+        if let Some(msg) = draft_msg {
+            self.apply_draft_msg(msg);
+        } else if recompute_preview {
+            self.recompute_preview();
+        }
         if let Some(msg) = selection_msg {
             self.apply_selection_msg(msg);
         }
@@ -318,18 +557,51 @@ fn render_commit_row(
     commit: &Commit,
     selected: bool,
     is_search_match: bool,
+    prow: Option<&PreviewRow>,
 ) -> egui::Response {
     let merge_marker = if commit.is_merge() { "⑂ " } else { "" };
     let short_sha = commit.id.short();
     let author = &commit.author.name;
     let date = format_relative_date(commit.author.time);
 
-    let text = format!(
-        "{merge_marker}{short_sha}  {:<60}  {author}  {date}",
-        commit.summary
-    );
+    // Projected summary (reflects a reword/set-message in the draft).
+    let summary = prow.map(|r| r.summary.as_str()).unwrap_or(&commit.summary);
+
+    // Draft status badge + styling.
+    let status = prow.map(|r| r.status).unwrap_or(RowStatus::Unchanged);
+    let badge = match status {
+        RowStatus::Unchanged => "",
+        RowStatus::Reworded => "[reworded] ",
+        RowStatus::Reauthored => "[reauthored] ",
+        RowStatus::RewordedAndReauthored => "[reworded+reauthored] ",
+        RowStatus::SquashKeep => "[squash←] ",
+        RowStatus::Absorbed => "[absorbed] ",
+        RowStatus::Flattened => "[flattened] ",
+        RowStatus::Dropped => "[dropped] ",
+    };
+    let moved_marker = if prow.is_some_and(|r| r.moved) {
+        "↕ "
+    } else {
+        ""
+    };
+
+    let text =
+        format!("{moved_marker}{merge_marker}{badge}{short_sha}  {summary:<60}  {author}  {date}");
 
     let mut rich_text = egui::RichText::new(&text).monospace();
+    match status {
+        RowStatus::Dropped | RowStatus::Absorbed => {
+            rich_text = rich_text.strikethrough().color(egui::Color32::GRAY);
+        }
+        RowStatus::Reworded
+        | RowStatus::Reauthored
+        | RowStatus::RewordedAndReauthored
+        | RowStatus::SquashKeep
+        | RowStatus::Flattened => {
+            rich_text = rich_text.color(egui::Color32::from_rgb(100, 150, 255));
+        }
+        RowStatus::Unchanged => {}
+    }
     if is_search_match && !selected {
         rich_text =
             rich_text.background_color(egui::Color32::from_rgba_premultiplied(80, 80, 0, 40));
