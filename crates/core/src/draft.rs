@@ -54,6 +54,8 @@ pub enum DraftMsg {
         paths: Vec<PathSpec>,
         add_to_gitignore: bool,
     },
+    /// Toggle flatten for a merge commit (add if absent, remove if present).
+    ToggleFlatten(CommitId),
     /// Remove the draft operation at the given index (no-op if out of range).
     RemoveOp(usize),
     /// Discard all drafts.
@@ -155,6 +157,17 @@ impl DraftState {
                             add_to_gitignore,
                         });
                     }
+                }
+            }
+            DraftMsg::ToggleFlatten(merge) => {
+                let existing = ops.iter().position(
+                    |op| matches!(op, Operation::FlattenMerge { merge: m } if *m == merge),
+                );
+                match existing {
+                    Some(idx) => {
+                        ops.remove(idx);
+                    }
+                    None => ops.push(Operation::FlattenMerge { merge }),
                 }
             }
             DraftMsg::RemoveOp(idx) => {
@@ -357,5 +370,25 @@ mod tests {
             })
             .reduce(DraftMsg::Clear);
         assert!(d.is_empty());
+    }
+
+    #[test]
+    fn toggle_flatten_adds_then_removes() {
+        let d = DraftState::new().reduce(DraftMsg::ToggleFlatten(cid("M")));
+        assert_eq!(d.len(), 1);
+        assert!(matches!(d.ops[0], Operation::FlattenMerge { .. }));
+
+        let d = d.reduce(DraftMsg::ToggleFlatten(cid("M")));
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn toggle_flatten_independent_per_merge() {
+        let d = DraftState::new()
+            .reduce(DraftMsg::ToggleFlatten(cid("M1")))
+            .reduce(DraftMsg::ToggleFlatten(cid("M2")))
+            .reduce(DraftMsg::ToggleFlatten(cid("M1")));
+        assert_eq!(d.len(), 1);
+        assert!(matches!(&d.ops[0], Operation::FlattenMerge { merge } if *merge == cid("M2")));
     }
 }
