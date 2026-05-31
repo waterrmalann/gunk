@@ -1,4 +1,4 @@
-use crate::model::{CommitId, Identity};
+use crate::model::{CommitId, Identity, PathSpec};
 use crate::operation::Operation;
 
 /// The pending set of draft operations the user has accumulated.
@@ -49,6 +49,11 @@ pub enum DraftMsg {
     ToggleDrop(CommitId),
     /// Reorder the range. Replaces any existing reorder.
     Reorder { new_order: Vec<CommitId> },
+    /// Remove paths from history. Merges with any existing RemovePaths op.
+    RemovePaths {
+        paths: Vec<PathSpec>,
+        add_to_gitignore: bool,
+    },
     /// Remove the draft operation at the given index (no-op if out of range).
     RemoveOp(usize),
     /// Discard all drafts.
@@ -120,6 +125,37 @@ impl DraftState {
             DraftMsg::Reorder { new_order } => {
                 ops.retain(|op| !matches!(op, Operation::Reorder { .. }));
                 ops.push(Operation::Reorder { new_order });
+            }
+            DraftMsg::RemovePaths {
+                paths,
+                add_to_gitignore,
+            } => {
+                // Merge into an existing RemovePaths op if present, otherwise add new.
+                let existing = ops
+                    .iter()
+                    .position(|op| matches!(op, Operation::RemovePaths { .. }));
+                match existing {
+                    Some(idx) => {
+                        if let Operation::RemovePaths {
+                            paths: ref mut existing_paths,
+                            add_to_gitignore: ref mut existing_agi,
+                        } = ops[idx]
+                        {
+                            for p in paths {
+                                if !existing_paths.contains(&p) {
+                                    existing_paths.push(p);
+                                }
+                            }
+                            *existing_agi = *existing_agi || add_to_gitignore;
+                        }
+                    }
+                    None => {
+                        ops.push(Operation::RemovePaths {
+                            paths,
+                            add_to_gitignore,
+                        });
+                    }
+                }
             }
             DraftMsg::RemoveOp(idx) => {
                 if idx < ops.len() {
