@@ -203,7 +203,7 @@ impl Git {
                 Vec::new()
             } else {
                 fields[1]
-                    .split(' ')
+                    .split_ascii_whitespace()
                     .map(|s| CommitId(s.to_string()))
                     .collect()
             };
