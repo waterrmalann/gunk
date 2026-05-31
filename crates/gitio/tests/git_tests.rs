@@ -242,6 +242,66 @@ fn walk_custom_author() {
     assert_eq!(commits[0].author.email, "alice@dev.io");
 }
 
+#[test]
+fn walk_commit_page_limits_and_reports_more_history() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "first", &[("a.txt", "a")]);
+    fixture.commit("c2", "second", &[("b.txt", "b")]);
+    fixture.commit("c3", "third", &[("c.txt", "c")]);
+    fixture.commit("c4", "fourth", &[("d.txt", "d")]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    let page = git.walk_commits_page("main", 0, 2).unwrap();
+
+    assert!(page.has_more);
+    assert_eq!(page.commits.len(), 2);
+    assert_eq!(page.commits[0].summary, "fourth");
+    assert_eq!(page.commits[1].summary, "third");
+}
+
+#[test]
+fn walk_commit_page_supports_skip_for_incremental_loading() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "first", &[("a.txt", "a")]);
+    fixture.commit("c2", "second", &[("b.txt", "b")]);
+    fixture.commit("c3", "third", &[("c.txt", "c")]);
+    fixture.commit("c4", "fourth", &[("d.txt", "d")]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    let page = git.walk_commits_page("main", 2, 2).unwrap();
+
+    assert!(!page.has_more);
+    assert_eq!(page.commits.len(), 2);
+    assert_eq!(page.commits[0].summary, "second");
+    assert_eq!(page.commits[1].summary, "first");
+}
+
+#[test]
+fn walk_commit_page_reports_no_more_when_result_matches_requested_size() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "first", &[("a.txt", "a")]);
+    fixture.commit("c2", "second", &[("b.txt", "b")]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    let page = git.walk_commits_page("main", 0, 2).unwrap();
+
+    assert!(!page.has_more);
+    assert_eq!(page.commits.len(), 2);
+}
+
+#[test]
+fn walk_commit_page_returns_empty_when_skip_is_past_history_end() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "first", &[("a.txt", "a")]);
+    fixture.commit("c2", "second", &[("b.txt", "b")]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    let page = git.walk_commits_page("main", 10, 2).unwrap();
+
+    assert!(!page.has_more);
+    assert!(page.commits.is_empty());
+}
+
 // ── changed_paths ──────────────────────────────────────────────────
 
 #[test]
@@ -288,6 +348,41 @@ fn changed_paths_deleted_file() {
     assert_eq!(paths.len(), 1);
     assert_eq!(paths[0].path, "f.txt");
     assert_eq!(paths[0].status, ChangeStatus::Deleted);
+}
+
+#[test]
+fn changed_paths_renamed_file_uses_new_path() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "add", &[("old.txt", "hello")]);
+    fixture.git(["mv", "old.txt", "new.txt"]);
+    fixture.commit("c2", "rename", &[]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    let paths = git.changed_paths(fixture.oid("c2")).unwrap();
+
+    assert_eq!(paths.len(), 1);
+    assert_eq!(paths[0].path, "new.txt");
+    assert_eq!(paths[0].status, ChangeStatus::Renamed);
+}
+
+#[test]
+fn changed_paths_copied_file_uses_new_path() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "add", &[("source.txt", "hello")]);
+    std::fs::copy(
+        fixture.path().join("source.txt"),
+        fixture.path().join("copy.txt"),
+    )
+    .unwrap();
+    fixture.git(["add", "copy.txt"]);
+    fixture.commit("c2", "copy", &[]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    let paths = git.changed_paths(fixture.oid("c2")).unwrap();
+
+    assert_eq!(paths.len(), 1);
+    assert_eq!(paths[0].path, "copy.txt");
+    assert_eq!(paths[0].status, ChangeStatus::Copied);
 }
 
 #[test]

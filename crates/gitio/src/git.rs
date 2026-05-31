@@ -44,6 +44,13 @@ pub struct BranchInfo {
     pub upstream: Option<String>,
 }
 
+/// A single page of commits from a branch walk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitPage {
+    pub commits: Vec<Commit>,
+    pub has_more: bool,
+}
+
 /// Thin wrapper over the `git` binary. All IO goes through here.
 #[derive(Debug, Clone)]
 pub struct Git {
@@ -180,61 +187,49 @@ impl Git {
     ///
     /// Parses all commits reachable from `branch`, including merges.
     pub fn walk_commits(&self, branch: &str) -> Result<Vec<Commit>, GitError> {
-        // Fields separated by %x00, records by %x01
-        // Fields: hash, parents, author_name, author_email, author_date,
-        //         committer_name, committer_email, committer_date, subject, body
         let output = self.run([
             "log",
             branch,
             "--pretty=format:%H%x00%P%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI%x00%s%x00%b%x01",
         ])?;
 
-        let mut commits = Vec::new();
-        for record in output.stdout.split('\x01') {
-            let record = record.trim();
-            if record.is_empty() {
-                continue;
-            }
-            let fields: Vec<&str> = record.splitn(10, '\0').collect();
-            if fields.len() < 10 {
-                return Err(GitError::Parse(format!(
-                    "expected 10 fields, got {}: {:?}",
-                    fields.len(),
-                    record.chars().take(120).collect::<String>()
-                )));
-            }
+        parse_commit_log(&output.stdout)
+    }
 
-            let parents = if fields[1].is_empty() {
-                Vec::new()
-            } else {
-                fields[1]
-                    .split_ascii_whitespace()
-                    .map(|s| CommitId(s.to_string()))
-                    .collect()
-            };
-
-            let author_time = parse_iso8601(fields[4])?;
-            let committer_time = parse_iso8601(fields[7])?;
-
-            commits.push(Commit {
-                id: CommitId(fields[0].to_string()),
-                parents,
-                author: Identity {
-                    name: fields[2].to_string(),
-                    email: fields[3].to_string(),
-                    time: author_time,
-                },
-                committer: Identity {
-                    name: fields[5].to_string(),
-                    email: fields[6].to_string(),
-                    time: committer_time,
-                },
-                summary: fields[8].to_string(),
-                body: fields[9].trim().to_string(),
-                changed_paths: Vec::new(), // loaded lazily via changed_paths()
+    /// Walk a page of commits from a branch, newest first.
+    ///
+    /// Over-fetches by one commit so callers can determine whether additional
+    /// history remains without a separate count command.
+    pub fn walk_commits_page(
+        &self,
+        branch: &str,
+        skip: usize,
+        max_count: usize,
+    ) -> Result<CommitPage, GitError> {
+        if max_count == 0 {
+            return Ok(CommitPage {
+                commits: Vec::new(),
+                has_more: false,
             });
         }
-        Ok(commits)
+
+        let skip = skip.to_string();
+        let over_fetch = max_count.saturating_add(1).to_string();
+        let output = self.run([
+            "log",
+            branch,
+            "--skip",
+            skip.as_str(),
+            "--max-count",
+            over_fetch.as_str(),
+            "--pretty=format:%H%x00%P%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI%x00%s%x00%b%x01",
+        ])?;
+
+        let mut commits = parse_commit_log(&output.stdout)?;
+        let has_more = commits.len() > max_count;
+        commits.truncate(max_count);
+
+        Ok(CommitPage { commits, has_more })
     }
 
     /// Get the changed file paths for a single commit.
@@ -246,6 +241,9 @@ impl Git {
             "--no-commit-id",
             "--name-status",
             "-r",
+            "-M",
+            "-C",
+            "--find-copies-harder",
             "--root", // handles root commits (diff vs empty tree)
             "-z",
             oid,
@@ -267,6 +265,55 @@ impl Git {
 fn parse_iso8601(s: &str) -> Result<OffsetDateTime, GitError> {
     OffsetDateTime::parse(s, &Iso8601::DEFAULT)
         .map_err(|e| GitError::Parse(format!("invalid timestamp '{s}': {e}")))
+}
+
+fn parse_commit_log(raw: &str) -> Result<Vec<Commit>, GitError> {
+    let mut commits = Vec::new();
+    for record in raw.split('\x01') {
+        let record = record.trim();
+        if record.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = record.splitn(10, '\0').collect();
+        if fields.len() < 10 {
+            return Err(GitError::Parse(format!(
+                "expected 10 fields, got {}: {:?}",
+                fields.len(),
+                record.chars().take(120).collect::<String>()
+            )));
+        }
+
+        let parents = if fields[1].is_empty() {
+            Vec::new()
+        } else {
+            fields[1]
+                .split_ascii_whitespace()
+                .map(|s| CommitId(s.to_string()))
+                .collect()
+        };
+
+        let author_time = parse_iso8601(fields[4])?;
+        let committer_time = parse_iso8601(fields[7])?;
+
+        commits.push(Commit {
+            id: CommitId(fields[0].to_string()),
+            parents,
+            author: Identity {
+                name: fields[2].to_string(),
+                email: fields[3].to_string(),
+                time: author_time,
+            },
+            committer: Identity {
+                name: fields[5].to_string(),
+                email: fields[6].to_string(),
+                time: committer_time,
+            },
+            summary: fields[8].to_string(),
+            body: fields[9].trim().to_string(),
+            changed_paths: Vec::new(),
+        });
+    }
+    Ok(commits)
 }
 
 /// Parse NUL-delimited name-status output from `git diff-tree -z`.
