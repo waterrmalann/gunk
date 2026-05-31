@@ -11,7 +11,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gunk_core::{CommitId, FilterRepoSpec, FlattenSpec, RebaseTodo, RebaseTodoLine};
+use gunk_core::{
+    CommitId, FilterRepoSpec, FlattenSpec, OidMap, RebaseTodo, RebaseTodoLine, compose_oid_maps,
+};
 use thiserror::Error;
 
 use crate::git::{Git, GitError};
@@ -47,6 +49,9 @@ pub enum ExecuteError {
 
     #[error("git-filter-repo is not installed")]
     FilterRepoNotInstalled,
+
+    #[error("could not retarget plan onto rewritten history: {0}")]
+    Remap(#[from] gunk_core::PlanError),
 }
 
 // ── Result of execution ────────────────────────────────────────────
@@ -62,6 +67,30 @@ pub struct ExecuteResult {
     pub branch: String,
     /// Commits that were reachable from remote-tracking refs (pushed history warning).
     pub pushed_commits: Vec<String>,
+    /// Maps pre-execution commit ids to post-execution ids (`None` = dropped).
+    ///
+    /// Populated by history-rewriting phases (flatten, filter-repo) so a
+    /// composite can retarget later phases onto the rewritten history. Rebase
+    /// leaves this empty: composite ordering guarantees no phase follows it.
+    pub oid_map: OidMap,
+}
+
+// ── Path / shell helpers ───────────────────────────────────────────
+
+/// Render a path as UTF-8, returning a clear error instead of silently
+/// substituting an empty string when the path is not representable.
+fn path_str(p: &std::path::Path) -> Result<&str, ExecuteError> {
+    p.to_str().ok_or_else(|| {
+        ExecuteError::WorktreeFailed(format!("path is not valid UTF-8: {}", p.display()))
+    })
+}
+
+/// Escape a string for safe embedding inside single quotes in a POSIX shell.
+///
+/// Closes the quote, inserts an escaped literal quote, and reopens — the
+/// standard `'\''` idiom — so paths containing `'` cannot break out.
+fn sh_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 // ── Safety checks ──────────────────────────────────────────────────
@@ -181,14 +210,8 @@ pub struct WorktreeGuard<'a> {
 impl<'a> WorktreeGuard<'a> {
     /// Add a detached worktree at `path` pointing to `commitish`.
     pub fn new(git: &'a Git, path: PathBuf, commitish: &str) -> Result<Self, ExecuteError> {
-        git.run([
-            "worktree",
-            "add",
-            "--detach",
-            path.to_str().unwrap_or(""),
-            commitish,
-        ])
-        .map_err(|e| ExecuteError::WorktreeFailed(e.to_string()))?;
+        git.run(["worktree", "add", "--detach", path_str(&path)?, commitish])
+            .map_err(|e| ExecuteError::WorktreeFailed(e.to_string()))?;
 
         Ok(Self {
             git,
@@ -315,6 +338,9 @@ pub fn execute_rebase(
                 new_tip,
                 branch: branch.to_string(),
                 pushed_commits,
+                // Rebase is always the final composite phase, so its rewrite
+                // map is never consumed; leave it empty.
+                oid_map: OidMap::new(),
             })
         }
         Err(e) => {
@@ -487,8 +513,8 @@ fn create_seq_editor_script(
 ) -> Result<(PathBuf, String), ExecuteError> {
     let script_path = repo_path.join(".gunk-seq-editor.sh");
     // Convert Windows backslashes to forward slashes for MSYS2 compatibility.
-    let todo_str = todo_path.to_str().unwrap_or("").replace('\\', "/");
-    let content = format!("#!/bin/sh\ncp '{}' \"$1\"\n", todo_str);
+    let todo_str = path_str(todo_path)?.replace('\\', "/");
+    let content = format!("#!/bin/sh\ncp {} \"$1\"\n", sh_single_quote(&todo_str));
     std::fs::write(&script_path, &content)
         .map_err(|e| ExecuteError::RehearsalFailed(format!("failed to write script: {e}")))?;
 
@@ -500,7 +526,7 @@ fn create_seq_editor_script(
     }
 
     // For the editor command, also use forward slashes.
-    let editor_cmd = script_path.to_str().unwrap_or("").replace('\\', "/");
+    let editor_cmd = path_str(&script_path)?.replace('\\', "/");
     Ok((script_path, editor_cmd))
 }
 
@@ -547,7 +573,7 @@ pub fn execute_flatten(
     let flatten_result = run_flatten_in(&wt_git, spec, branch);
 
     match flatten_result {
-        Ok(new_tip) => {
+        Ok((new_tip, oid_map)) => {
             guard.remove()?;
             git.run(["update-ref", &format!("refs/heads/{branch}"), &new_tip])?;
 
@@ -567,6 +593,7 @@ pub fn execute_flatten(
                 new_tip,
                 branch: branch.to_string(),
                 pushed_commits,
+                oid_map,
             })
         }
         Err(e) => {
@@ -581,7 +608,15 @@ pub fn execute_flatten(
 /// 1. Get the merge commit's tree.
 /// 2. Create a new ordinary commit with that tree, parented on mainline.
 /// 3. Rebase all descendants onto the new commit.
-fn run_flatten_in(git: &Git, spec: &FlattenSpec, _branch: &str) -> Result<String, ExecuteError> {
+///
+/// Returns the new branch tip and an [`OidMap`] from pre-flatten ids to their
+/// post-flatten ids (the merge and every descendant change id; ancestors are
+/// unchanged and omitted).
+fn run_flatten_in(
+    git: &Git,
+    spec: &FlattenSpec,
+    _branch: &str,
+) -> Result<(String, OidMap), ExecuteError> {
     // Get the merge commit's tree (T = M^{tree}).
     let tree = git
         .run(["rev-parse", &format!("{}^{{tree}}", spec.merge.0)])?
@@ -610,7 +645,9 @@ fn run_flatten_in(git: &Git, spec: &FlattenSpec, _branch: &str) -> Result<String
     if branch_tip == spec.merge.0 {
         // The merge is the tip; no descendants to rebase.
         git.run(["checkout", &new_commit])?;
-        return Ok(new_commit);
+        let mut map = OidMap::new();
+        map.insert(spec.merge.clone(), Some(CommitId(new_commit.clone())));
+        return Ok((new_commit, map));
     }
 
     // Rebase everything after the merge onto M'.
@@ -643,7 +680,23 @@ fn run_flatten_in(git: &Git, spec: &FlattenSpec, _branch: &str) -> Result<String
 
     // Get the new tip.
     let new_tip = git.run(["rev-parse", "HEAD"])?.stdout.trim().to_string();
-    Ok(new_tip)
+
+    // Build the rewrite map: the merge maps to M', and each old descendant
+    // (in rebase order) maps to its rewritten counterpart. `rev-list A..B`
+    // lists B's history excluding A's, newest-first; the old and new ranges
+    // are the same length because flatten's rebase drops no commits.
+    let mut map = OidMap::new();
+    map.insert(spec.merge.clone(), Some(CommitId(new_commit.clone())));
+
+    let old_desc = git.run(["rev-list", &format!("{}..{}", spec.merge.0, branch_tip)])?;
+    let new_desc = git.run(["rev-list", &format!("{new_commit}..{new_tip}")])?;
+    let old_ids: Vec<&str> = old_desc.stdout.lines().filter(|l| !l.is_empty()).collect();
+    let new_ids: Vec<&str> = new_desc.stdout.lines().filter(|l| !l.is_empty()).collect();
+    for (old, new) in old_ids.iter().zip(new_ids.iter()) {
+        map.insert(CommitId(old.to_string()), Some(CommitId(new.to_string())));
+    }
+
+    Ok((new_tip, map))
 }
 
 // ── git-filter-repo detection ──────────────────────────────────────
@@ -659,14 +712,17 @@ pub fn has_filter_repo(git: &Git) -> bool {
 
 /// Execute a filter-repo plan against a branch.
 ///
-/// This follows the same safety protocol as `execute_rebase`:
+/// Follows the same rehearse-then-apply safety protocol as `execute_rebase`:
 /// 1. Check for dirty tree.
 /// 2. Create a backup ref.
-/// 3. Run `git filter-repo --invert-paths` with the specified paths.
-/// 4. Optionally append removed paths to `.gitignore`.
+/// 3. Rehearse the rewrite in an isolated throwaway clone.
+/// 4. Apply only on success by fetching the rewritten tip back.
 ///
-/// Note: `git filter-repo` requires `--force` when run on a repo that is not
-/// freshly cloned.
+/// Unlike rebase/flatten, the rehearsal uses a full clone rather than a linked
+/// worktree: `filter-repo` rewrites the shared object store and rewrites refs by
+/// name, so a worktree (which shares both) cannot isolate it. The clone gives
+/// `filter-repo` a private object store to mutate; the real repo is untouched
+/// until the rewritten objects are fetched back and the branch ref is updated.
 pub fn execute_filter_repo(
     git: &Git,
     branch: &str,
@@ -678,18 +734,82 @@ pub fn execute_filter_repo(
     // 2. Backup ref.
     let backup_ref = create_backup_ref(git, branch)?;
 
-    // Build filter-repo arguments.
+    // 3. Rehearse in an isolated clone. Clean up any stale rehearsal dir first.
+    let clone_path = git.repo_path().join(".gunk-filter-rehearsal");
+    if clone_path.exists() {
+        let _ = std::fs::remove_dir_all(&clone_path);
+    }
+
+    let rehearsal = rehearse_filter_repo(git, branch, spec, &clone_path);
+
+    // Always remove the throwaway clone, regardless of outcome.
+    let _ = std::fs::remove_dir_all(&clone_path);
+
+    // On rehearsal failure the real repo is pristine — nothing to restore.
+    let (new_tip, oid_map) = rehearsal?;
+
+    // 4. Apply: point the real branch at the rewritten tip (objects already
+    //    fetched into the real repo during rehearsal).
+    git.run(["update-ref", &format!("refs/heads/{branch}"), &new_tip])?;
+
+    let current = git
+        .run(["symbolic-ref", "--short", "HEAD"])
+        .ok()
+        .map(|o| o.stdout.trim().to_string());
+    if current.as_deref() == Some(branch) {
+        git.run(["reset", "--hard", &new_tip])?;
+    }
+
+    // Push warning: compare against the pre-rewrite tip.
+    let old_tip = git
+        .run(["rev-parse", &backup_ref])
+        .map(|o| o.stdout.trim().to_string())
+        .unwrap_or_default();
+    let pushed_commits = check_pushed_commits(git, &[&old_tip]).unwrap_or_default();
+
+    Ok(ExecuteResult {
+        backup_ref,
+        new_tip,
+        branch: branch.to_string(),
+        pushed_commits,
+        oid_map,
+    })
+}
+
+/// Rehearse a filter-repo rewrite in an isolated clone and fetch the rewritten
+/// tip back into the real repo. Returns the new branch tip OID and the
+/// original→rewritten id map read from filter-repo's `commit-map`.
+///
+/// The real repo's refs are never modified here; only objects are added by the
+/// final fetch. The caller is responsible for updating the branch ref.
+fn rehearse_filter_repo(
+    git: &Git,
+    branch: &str,
+    spec: &FilterRepoSpec,
+    clone_path: &std::path::Path,
+) -> Result<(String, OidMap), ExecuteError> {
+    // Clone just the target branch with real object copies (no hardlinks, so
+    // filter-repo's repack/gc in the clone can never touch the source's packs).
+    git.run([
+        "clone",
+        "--no-hardlinks",
+        "--single-branch",
+        "--branch",
+        branch,
+        path_str(git.repo_path())?,
+        path_str(clone_path)?,
+    ])
+    .map_err(|e| ExecuteError::FilterRepoFailed(format!("rehearsal clone failed: {e}")))?;
+
+    let clone_git = Git::at(clone_path.to_path_buf());
+
+    // Build filter-repo arguments. The clone has only this branch, so no --refs
+    // scoping is needed; --force is required because the clone has reflogs.
     let mut args: Vec<String> = vec![
         "filter-repo".to_string(),
         "--invert-paths".to_string(),
         "--force".to_string(),
-        // Scope to the target branch only. This puts filter-repo in "partial"
-        // mode, which skips GC and leaves other refs (including our backup refs)
-        // untouched, preserving the old commit objects.
-        "--refs".to_string(),
-        format!("refs/heads/{branch}"),
     ];
-
     for path in &spec.paths {
         // Use --path-glob for patterns with wildcards, --path for exact paths.
         if path.0.contains('*') || path.0.contains('?') || path.0.contains('[') {
@@ -700,42 +820,69 @@ pub fn execute_filter_repo(
         args.push(path.0.clone());
     }
 
-    // Run filter-repo.
-    let result = git.run(args.iter().map(|s| s.as_str()));
+    clone_git
+        .run(args.iter().map(|s| s.as_str()))
+        .map_err(|e| ExecuteError::FilterRepoFailed(e.to_string()))?;
 
-    match result {
-        Ok(_) => {
-            // Optionally append to .gitignore.
-            if spec.add_to_gitignore {
-                append_to_gitignore(git, branch, &spec.paths)?;
-            }
+    // Read filter-repo's authoritative old→new map before adding anything on
+    // top. Commits dropped by the filter map to an all-zero id.
+    let commit_map_path = clone_path.join(".git/filter-repo/commit-map");
+    let oid_map = std::fs::read_to_string(&commit_map_path)
+        .map(|text| parse_commit_map(&text))
+        .map_err(|e| {
+            ExecuteError::FilterRepoFailed(format!("could not read filter-repo commit-map: {e}"))
+        })?;
 
-            // Get the new tip.
-            let new_tip = git
-                .run(["rev-parse", branch])
-                .map(|o| o.stdout.trim().to_string())
-                .unwrap_or_default();
-
-            // Check for pushed commits.
-            let old_tip = git
-                .run(["rev-parse", &backup_ref])
-                .map(|o| o.stdout.trim().to_string())
-                .unwrap_or_default();
-            let pushed_commits = check_pushed_commits(git, &[&old_tip]).unwrap_or_default();
-
-            Ok(ExecuteResult {
-                backup_ref,
-                new_tip,
-                branch: branch.to_string(),
-                pushed_commits,
-            })
-        }
-        Err(e) => {
-            // filter-repo failed. Restore from backup.
-            let _ = restore_backup(git, branch, &backup_ref);
-            Err(ExecuteError::FilterRepoFailed(e.to_string()))
-        }
+    // Optionally append to .gitignore as part of the rewritten branch. This
+    // sits on top of the filtered history and is intentionally absent from the
+    // commit-map (no prior operation references it).
+    if spec.add_to_gitignore {
+        append_to_gitignore(&clone_git, branch, &spec.paths)?;
     }
+
+    // The rewritten tip in the clone.
+    let new_tip = clone_git
+        .run(["rev-parse", branch])
+        .map_err(|e| ExecuteError::FilterRepoFailed(format!("rewrite produced no tip: {e}")))?
+        .stdout
+        .trim()
+        .to_string();
+
+    // Copy the rewritten objects into the real repo (refs untouched).
+    git.run([
+        "fetch",
+        "--no-tags",
+        path_str(clone_path)?,
+        &format!("refs/heads/{branch}"),
+    ])
+    .map_err(|e| ExecuteError::FilterRepoFailed(format!("fetching rewrite failed: {e}")))?;
+
+    Ok((new_tip, oid_map))
+}
+
+/// Parse filter-repo's `commit-map` file into an [`OidMap`].
+///
+/// The file has a header line (`old new`) followed by `<old-sha> <new-sha>`
+/// pairs. A new-sha of all zeros marks a commit dropped by the filter.
+fn parse_commit_map(text: &str) -> OidMap {
+    let is_hex_sha = |s: &str| s.len() >= 40 && s.bytes().all(|b| b.is_ascii_hexdigit());
+    let mut map = OidMap::new();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(old), Some(new)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if !is_hex_sha(old) {
+            continue; // header or malformed line
+        }
+        let value = if new.bytes().all(|b| b == b'0') {
+            None // dropped
+        } else {
+            Some(CommitId(new.to_string()))
+        };
+        map.insert(CommitId(old.to_string()), value);
+    }
+    map
 }
 
 /// Append paths to `.gitignore` and commit the change.
@@ -767,12 +914,7 @@ fn append_to_gitignore(
 
     // Stage and commit.
     git.run(["add", ".gitignore"])?;
-    git.run([
-        "commit",
-        "-m",
-        "chore: add removed paths to .gitignore",
-        "--allow-empty",
-    ])?;
+    git.run(["commit", "-m", "chore: add removed paths to .gitignore"])?;
 
     Ok(())
 }
@@ -819,6 +961,11 @@ pub fn execute_plan(
 ///
 /// Creates a single backup ref for the entire composite. If any sub-plan
 /// fails, restores from the initial backup.
+///
+/// Sub-plans are built against the *original* snapshot, but each history-
+/// rewriting phase (flatten, filter-repo) changes commit ids. Before running a
+/// later phase, its plan is retargeted through the accumulated rewrite map so
+/// its operations land on the ids that actually exist at that point.
 fn execute_composite(
     git: &Git,
     branch: &str,
@@ -834,10 +981,21 @@ fn execute_composite(
     // 2. Create a single backup ref for the entire composite.
     let backup_ref = create_backup_ref(git, branch)?;
 
+    // Original→current id map, accumulated across rewrite phases.
+    let mut accumulated: OidMap = OidMap::new();
     let mut last_result: Option<ExecuteResult> = None;
 
     for sub_plan in plans {
-        let sub_result = match sub_plan {
+        // Retarget this phase's plan onto the history produced by prior phases.
+        let remapped = match sub_plan.remap_oids(&accumulated) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = restore_backup(git, branch, &backup_ref);
+                return Err(e.into());
+            }
+        };
+
+        let sub_result = match &remapped {
             gunk_core::ExecutionPlan::Rebase(todo) => execute_rebase(git, branch, todo),
             gunk_core::ExecutionPlan::FilterRepo(spec) => execute_filter_repo(git, branch, spec),
             gunk_core::ExecutionPlan::Flatten(spec) => execute_flatten(git, branch, spec),
@@ -846,6 +1004,9 @@ fn execute_composite(
 
         match sub_result {
             Ok(result) => {
+                // Fold this phase's rewrite into the accumulated map so the next
+                // phase (still in original ids) resolves all the way through.
+                accumulated = compose_oid_maps(&accumulated, &result.oid_map);
                 last_result = Some(result);
             }
             Err(e) => {
@@ -856,13 +1017,15 @@ fn execute_composite(
         }
     }
 
-    // Return the composite result with the original (top-level) backup ref.
+    // Return the composite result with the original (top-level) backup ref and
+    // the full original→final rewrite map.
     let final_result = last_result.unwrap();
     Ok(ExecuteResult {
         backup_ref,
         new_tip: final_result.new_tip,
         branch: final_result.branch,
         pushed_commits: final_result.pushed_commits,
+        oid_map: accumulated,
     })
 }
 
