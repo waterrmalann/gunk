@@ -1,9 +1,10 @@
-use gunk_core::{CommitId, ExecutionPlan, Operation, RebaseTodo, RebaseTodoLine, plan};
+use gunk_core::{CommitId, ExecutionPlan, Identity, Operation, RebaseTodo, RebaseTodoLine, plan};
 use gunk_gitio::{
     Git, check_clean, create_backup_ref, execute_rebase, format_rebase_todo, list_backup_refs,
     restore_backup, stash_pop, stash_push,
 };
 use gunk_testkit::RepoFixture;
+use time::OffsetDateTime;
 
 // ── Safety: dirty tree check ───────────────────────────────────────
 
@@ -594,4 +595,533 @@ fn execute_rebase_on_non_checked_out_branch() {
 
     // Backup ref should exist.
     assert!(result.backup_ref.starts_with("refs/gunk/backup/feature/"));
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Phase 5 — End-to-end wiring of rebase-class features
+// ════════════════════════════════════════════════════════════════════
+
+// ── Reword ─────────────────────────────────────────────────────────
+
+#[test]
+fn execute_rebase_rewords_single_commit() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "first", &[("a.txt", "a")]);
+    fixture.commit("c2", "second", &[("b.txt", "b")]);
+    fixture.commit("c3", "third", &[("c.txt", "c")]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    let commits = git.walk_commits("main").unwrap();
+    // commits: [c3, c2, c1]
+
+    // Reword c2 (middle commit).
+    let operations = vec![Operation::Reword {
+        target: commits[1].id.clone(),
+        summary: "reworded second".to_string(),
+        body: String::new(),
+    }];
+
+    let plan_result = plan(&commits, &operations).unwrap();
+    let todo = match plan_result {
+        ExecutionPlan::Rebase(todo) => todo,
+        _ => panic!("expected rebase plan"),
+    };
+
+    let _result = execute_rebase(&git, "main", &todo).unwrap();
+
+    let new_commits = git.walk_commits("main").unwrap();
+    assert_eq!(new_commits.len(), 3);
+    assert_eq!(new_commits[0].summary, "third");
+    assert_eq!(new_commits[1].summary, "reworded second");
+    assert_eq!(new_commits[2].summary, "first");
+}
+
+#[test]
+fn execute_rebase_rewords_with_multiline_message() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "first", &[("a.txt", "a")]);
+    fixture.commit("c2", "second", &[("b.txt", "b")]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    let commits = git.walk_commits("main").unwrap();
+
+    let operations = vec![Operation::Reword {
+        target: commits[0].id.clone(),
+        summary: "new subject".to_string(),
+        body: "This is a detailed body.\n\nWith multiple paragraphs.".to_string(),
+    }];
+
+    let plan_result = plan(&commits, &operations).unwrap();
+    let todo = match plan_result {
+        ExecutionPlan::Rebase(todo) => todo,
+        _ => panic!("expected rebase plan"),
+    };
+
+    let _result = execute_rebase(&git, "main", &todo).unwrap();
+
+    let new_commits = git.walk_commits("main").unwrap();
+    assert_eq!(new_commits[0].summary, "new subject");
+    assert!(
+        new_commits[0].body.contains("With multiple paragraphs."),
+        "body should contain multiline content, got: {:?}",
+        new_commits[0].body
+    );
+}
+
+#[test]
+fn execute_rebase_rewords_with_special_characters() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "first", &[("a.txt", "a")]);
+    fixture.commit("c2", "second", &[("b.txt", "b")]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    let commits = git.walk_commits("main").unwrap();
+
+    let operations = vec![Operation::Reword {
+        target: commits[0].id.clone(),
+        summary: "fix: handle \"quotes\" & $pecial chars".to_string(),
+        body: "Backticks `code` and single 'quotes' too.".to_string(),
+    }];
+
+    let plan_result = plan(&commits, &operations).unwrap();
+    let todo = match plan_result {
+        ExecutionPlan::Rebase(todo) => todo,
+        _ => panic!("expected rebase plan"),
+    };
+
+    let _result = execute_rebase(&git, "main", &todo).unwrap();
+
+    let new_commits = git.walk_commits("main").unwrap();
+    assert_eq!(
+        new_commits[0].summary,
+        "fix: handle \"quotes\" & $pecial chars"
+    );
+    assert!(new_commits[0].body.contains("Backticks `code`"));
+}
+
+#[test]
+fn execute_rebase_rewords_root_commit() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "initial", &[("a.txt", "a")]);
+    fixture.commit("c2", "second", &[("b.txt", "b")]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    let commits = git.walk_commits("main").unwrap();
+
+    // Reword the root commit.
+    let operations = vec![Operation::Reword {
+        target: commits[1].id.clone(), // c1 is the root (oldest)
+        summary: "reworded root".to_string(),
+        body: String::new(),
+    }];
+
+    let plan_result = plan(&commits, &operations).unwrap();
+    let todo = match plan_result {
+        ExecutionPlan::Rebase(todo) => todo,
+        _ => panic!("expected rebase plan"),
+    };
+
+    let _result = execute_rebase(&git, "main", &todo).unwrap();
+
+    let new_commits = git.walk_commits("main").unwrap();
+    assert_eq!(new_commits.len(), 2);
+    assert_eq!(new_commits[1].summary, "reworded root");
+    assert_eq!(new_commits[0].summary, "second");
+}
+
+// ── Bulk set-message ───────────────────────────────────────────────
+
+#[test]
+fn execute_rebase_bulk_set_message() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "first", &[("a.txt", "a")]);
+    fixture.commit("c2", "second", &[("b.txt", "b")]);
+    fixture.commit("c3", "third", &[("c.txt", "c")]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    let commits = git.walk_commits("main").unwrap();
+
+    // Set the same message on c1 and c3.
+    let operations = vec![Operation::SetMessage {
+        targets: vec![commits[2].id.clone(), commits[0].id.clone()],
+        summary: "unified message".to_string(),
+        body: String::new(),
+    }];
+
+    let plan_result = plan(&commits, &operations).unwrap();
+    let todo = match plan_result {
+        ExecutionPlan::Rebase(todo) => todo,
+        _ => panic!("expected rebase plan"),
+    };
+
+    let _result = execute_rebase(&git, "main", &todo).unwrap();
+
+    let new_commits = git.walk_commits("main").unwrap();
+    assert_eq!(new_commits.len(), 3);
+    assert_eq!(new_commits[0].summary, "unified message");
+    assert_eq!(new_commits[1].summary, "second"); // untouched
+    assert_eq!(new_commits[2].summary, "unified message");
+}
+
+// ── Set-author ─────────────────────────────────────────────────────
+
+#[test]
+fn execute_rebase_set_author_single_commit() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "first", &[("a.txt", "a")]);
+    fixture.commit("c2", "second", &[("b.txt", "b")]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    let commits = git.walk_commits("main").unwrap();
+
+    let operations = vec![Operation::SetAuthor {
+        targets: vec![commits[0].id.clone()],
+        author: Identity {
+            name: "New Author".to_string(),
+            email: "new@example.com".to_string(),
+            time: OffsetDateTime::now_utc(),
+        },
+    }];
+
+    let plan_result = plan(&commits, &operations).unwrap();
+    let todo = match plan_result {
+        ExecutionPlan::Rebase(todo) => todo,
+        _ => panic!("expected rebase plan"),
+    };
+
+    let _result = execute_rebase(&git, "main", &todo).unwrap();
+
+    let new_commits = git.walk_commits("main").unwrap();
+    assert_eq!(new_commits[0].author.name, "New Author");
+    assert_eq!(new_commits[0].author.email, "new@example.com");
+    // Message should be preserved.
+    assert_eq!(new_commits[0].summary, "second");
+}
+
+#[test]
+fn execute_rebase_set_author_bulk() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "first", &[("a.txt", "a")]);
+    fixture.commit("c2", "second", &[("b.txt", "b")]);
+    fixture.commit("c3", "third", &[("c.txt", "c")]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    let commits = git.walk_commits("main").unwrap();
+
+    let operations = vec![Operation::SetAuthor {
+        targets: vec![
+            commits[0].id.clone(),
+            commits[1].id.clone(),
+            commits[2].id.clone(),
+        ],
+        author: Identity {
+            name: "Bulk Author".to_string(),
+            email: "bulk@example.com".to_string(),
+            time: OffsetDateTime::now_utc(),
+        },
+    }];
+
+    let plan_result = plan(&commits, &operations).unwrap();
+    let todo = match plan_result {
+        ExecutionPlan::Rebase(todo) => todo,
+        _ => panic!("expected rebase plan"),
+    };
+
+    let _result = execute_rebase(&git, "main", &todo).unwrap();
+
+    let new_commits = git.walk_commits("main").unwrap();
+    for c in &new_commits {
+        assert_eq!(c.author.name, "Bulk Author");
+        assert_eq!(c.author.email, "bulk@example.com");
+    }
+}
+
+// ── Reword with empty body ─────────────────────────────────────────
+
+#[test]
+fn execute_rebase_rewords_with_empty_body() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "first\n\noriginal body here", &[("a.txt", "a")]);
+    fixture.commit("c2", "second", &[("b.txt", "b")]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    let commits = git.walk_commits("main").unwrap();
+
+    // Reword to have only a summary (no body).
+    let operations = vec![Operation::Reword {
+        target: commits[1].id.clone(),
+        summary: "clean subject only".to_string(),
+        body: String::new(),
+    }];
+
+    let plan_result = plan(&commits, &operations).unwrap();
+    let todo = match plan_result {
+        ExecutionPlan::Rebase(todo) => todo,
+        _ => panic!("expected rebase plan"),
+    };
+
+    let _result = execute_rebase(&git, "main", &todo).unwrap();
+
+    let new_commits = git.walk_commits("main").unwrap();
+    assert_eq!(new_commits[1].summary, "clean subject only");
+    assert!(
+        new_commits[1].body.trim().is_empty(),
+        "body should be empty after reword, got: {:?}",
+        new_commits[1].body
+    );
+}
+
+// ── Squash with prepared message ───────────────────────────────────
+
+#[test]
+fn execute_rebase_squash_with_custom_message() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "first", &[("a.txt", "a")]);
+    fixture.commit("c2", "second", &[("b.txt", "b")]);
+    fixture.commit("c3", "third", &[("c.txt", "c")]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    let commits = git.walk_commits("main").unwrap();
+
+    // Squash c2 into c1 AND reword c1 with a specific message.
+    let operations = vec![
+        Operation::Squash {
+            keep: commits[2].id.clone(),         // c1
+            absorb: vec![commits[1].id.clone()], // c2
+        },
+        Operation::Reword {
+            target: commits[2].id.clone(),
+            summary: "combined: first and second".to_string(),
+            body: "This squash combines both changes.".to_string(),
+        },
+    ];
+
+    let plan_result = plan(&commits, &operations).unwrap();
+    let todo = match plan_result {
+        ExecutionPlan::Rebase(todo) => todo,
+        _ => panic!("expected rebase plan"),
+    };
+
+    let _result = execute_rebase(&git, "main", &todo).unwrap();
+
+    let new_commits = git.walk_commits("main").unwrap();
+    assert_eq!(new_commits.len(), 2);
+    assert_eq!(new_commits[0].summary, "third");
+    assert_eq!(new_commits[1].summary, "combined: first and second");
+    assert!(
+        new_commits[1].body.contains("squash combines both"),
+        "body should contain the custom message, got: {:?}",
+        new_commits[1].body
+    );
+
+    // Both files should exist.
+    assert!(fixture.path().join("a.txt").exists());
+    assert!(fixture.path().join("b.txt").exists());
+}
+
+#[test]
+fn execute_rebase_squash_preserves_combined_message_when_no_reword() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "first", &[("a.txt", "a")]);
+    fixture.commit("c2", "second", &[("b.txt", "b")]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    let commits = git.walk_commits("main").unwrap();
+
+    // Squash without reword: should preserve combined messages.
+    let operations = vec![Operation::Squash {
+        keep: commits[1].id.clone(),
+        absorb: vec![commits[0].id.clone()],
+    }];
+
+    let plan_result = plan(&commits, &operations).unwrap();
+    let todo = match plan_result {
+        ExecutionPlan::Rebase(todo) => todo,
+        _ => panic!("expected rebase plan"),
+    };
+
+    let _result = execute_rebase(&git, "main", &todo).unwrap();
+
+    let new_commits = git.walk_commits("main").unwrap();
+    assert_eq!(new_commits.len(), 1);
+    // Default squash combines messages — both should appear.
+    let full_msg = fixture.message(&new_commits[0].id.0);
+    assert!(
+        full_msg.contains("first") && full_msg.contains("second"),
+        "combined message should contain both subjects, got: {full_msg:?}"
+    );
+}
+
+// ── Fixup ──────────────────────────────────────────────────────────
+
+#[test]
+fn execute_rebase_fixup_discards_absorbed_message() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "first", &[("a.txt", "a")]);
+    fixture.commit("c2", "fixme: typo fix", &[("a.txt", "a-fixed")]);
+    fixture.commit("c3", "third", &[("c.txt", "c")]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    let commits = git.walk_commits("main").unwrap();
+
+    let operations = vec![Operation::Fixup {
+        keep: commits[2].id.clone(),         // c1
+        absorb: vec![commits[1].id.clone()], // c2
+    }];
+
+    let plan_result = plan(&commits, &operations).unwrap();
+    let todo = match plan_result {
+        ExecutionPlan::Rebase(todo) => todo,
+        _ => panic!("expected rebase plan"),
+    };
+
+    let _result = execute_rebase(&git, "main", &todo).unwrap();
+
+    let new_commits = git.walk_commits("main").unwrap();
+    assert_eq!(new_commits.len(), 2);
+    assert_eq!(new_commits[0].summary, "third");
+    // Fixup: only the keep commit's message survives.
+    assert_eq!(new_commits[1].summary, "first");
+    let full_msg = fixture.message(&new_commits[1].id.0);
+    assert!(
+        !full_msg.contains("fixme"),
+        "fixup should discard absorbed message, got: {full_msg:?}"
+    );
+}
+
+// ── Combined operations ────────────────────────────────────────────
+
+#[test]
+fn execute_rebase_combined_reword_and_author() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "first", &[("a.txt", "a")]);
+    fixture.commit("c2", "second", &[("b.txt", "b")]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    let commits = git.walk_commits("main").unwrap();
+
+    // Reword AND change author on the same commit.
+    let operations = vec![
+        Operation::Reword {
+            target: commits[0].id.clone(),
+            summary: "reworded".to_string(),
+            body: String::new(),
+        },
+        Operation::SetAuthor {
+            targets: vec![commits[0].id.clone()],
+            author: Identity {
+                name: "New Person".to_string(),
+                email: "new@example.com".to_string(),
+                time: OffsetDateTime::now_utc(),
+            },
+        },
+    ];
+
+    let plan_result = plan(&commits, &operations).unwrap();
+    let todo = match plan_result {
+        ExecutionPlan::Rebase(todo) => todo,
+        _ => panic!("expected rebase plan"),
+    };
+
+    let _result = execute_rebase(&git, "main", &todo).unwrap();
+
+    let new_commits = git.walk_commits("main").unwrap();
+    assert_eq!(new_commits[0].summary, "reworded");
+    assert_eq!(new_commits[0].author.name, "New Person");
+    assert_eq!(new_commits[0].author.email, "new@example.com");
+}
+
+#[test]
+fn execute_rebase_combined_squash_reword_author_drop() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "first", &[("a.txt", "a")]);
+    fixture.commit("c2", "second", &[("b.txt", "b")]);
+    fixture.commit("c3", "third", &[("c.txt", "c")]);
+    fixture.commit("c4", "fourth", &[("d.txt", "d")]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    let commits = git.walk_commits("main").unwrap();
+    // commits: [c4, c3, c2, c1]
+
+    let operations = vec![
+        // Squash c2 into c1 with a custom message.
+        Operation::Squash {
+            keep: commits[3].id.clone(),         // c1
+            absorb: vec![commits[2].id.clone()], // c2
+        },
+        Operation::Reword {
+            target: commits[3].id.clone(),
+            summary: "merged first+second".to_string(),
+            body: String::new(),
+        },
+        // Drop c3.
+        Operation::Drop {
+            target: commits[1].id.clone(),
+        },
+        // Change author on c4.
+        Operation::SetAuthor {
+            targets: vec![commits[0].id.clone()],
+            author: Identity {
+                name: "Changed".to_string(),
+                email: "changed@example.com".to_string(),
+                time: OffsetDateTime::now_utc(),
+            },
+        },
+    ];
+
+    let plan_result = plan(&commits, &operations).unwrap();
+    let todo = match plan_result {
+        ExecutionPlan::Rebase(todo) => todo,
+        _ => panic!("expected rebase plan"),
+    };
+
+    let _result = execute_rebase(&git, "main", &todo).unwrap();
+
+    let new_commits = git.walk_commits("main").unwrap();
+    // Should have 2 commits: c4 (author changed) and c1+c2 (squashed+reworded).
+    assert_eq!(new_commits.len(), 2);
+
+    // c4 should have the new author.
+    assert_eq!(new_commits[0].summary, "fourth");
+    assert_eq!(new_commits[0].author.name, "Changed");
+
+    // c1+c2 should be squashed with custom message.
+    assert_eq!(new_commits[1].summary, "merged first+second");
+
+    // All relevant files should exist (c3's file might be gone since it was dropped).
+    assert!(fixture.path().join("a.txt").exists());
+    assert!(fixture.path().join("b.txt").exists());
+    assert!(fixture.path().join("d.txt").exists());
+}
+
+// ── Message file cleanup ───────────────────────────────────────────
+
+#[test]
+fn execute_rebase_cleans_up_message_files() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "first", &[("a.txt", "a")]);
+    fixture.commit("c2", "second", &[("b.txt", "b")]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    let commits = git.walk_commits("main").unwrap();
+
+    let operations = vec![Operation::Reword {
+        target: commits[0].id.clone(),
+        summary: "reworded".to_string(),
+        body: String::new(),
+    }];
+
+    let plan_result = plan(&commits, &operations).unwrap();
+    let todo = match plan_result {
+        ExecutionPlan::Rebase(todo) => todo,
+        _ => panic!("expected rebase plan"),
+    };
+
+    let _result = execute_rebase(&git, "main", &todo).unwrap();
+
+    // Worktree and all temp files should be cleaned up.
+    assert!(
+        !fixture.path().join(".gunk-rehearsal").exists(),
+        "worktree should be removed after execution"
+    );
 }
