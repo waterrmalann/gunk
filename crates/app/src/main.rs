@@ -225,15 +225,23 @@ impl App {
 
     /// Execute the current draft plan against the repository.
     ///
-    /// For composite plans (e.g., RemovePaths + Reword), this handles the
-    /// filter-repo → re-snapshot → rebase pipeline: filter-repo rewrites all
-    /// OIDs, so the rebase todo must be re-derived from the fresh snapshot.
+    /// For composite plans, this handles the
+    /// flatten → filter-repo → re-snapshot → rebase pipeline: flatten and
+    /// filter-repo both rewrite OIDs, so subsequent phases must re-derive
+    /// from a fresh snapshot.
     fn execute_plan(&mut self) {
         let Some(repo) = &mut self.repo else { return };
 
         let branch = repo.branches[repo.selected_branch].name.clone();
 
-        // Separate operations into filter-repo and rebase groups.
+        // Separate operations into flatten, filter-repo, and rebase groups.
+        let flatten_ops: Vec<_> = repo
+            .draft
+            .ops
+            .iter()
+            .filter(|op| matches!(op, gunk_core::Operation::FlattenMerge { .. }))
+            .cloned()
+            .collect();
         let filter_ops: Vec<_> = repo
             .draft
             .ops
@@ -245,12 +253,56 @@ impl App {
             .draft
             .ops
             .iter()
-            .filter(|op| !matches!(op, gunk_core::Operation::RemovePaths { .. }))
+            .filter(|op| {
+                !matches!(
+                    op,
+                    gunk_core::Operation::RemovePaths { .. }
+                        | gunk_core::Operation::FlattenMerge { .. }
+                )
+            })
             .cloned()
             .collect();
 
+        let has_flatten = !flatten_ops.is_empty();
         let has_filter = !filter_ops.is_empty();
         let has_rebase = !rebase_ops.is_empty();
+        let remaining_after_flatten = has_filter || has_rebase;
+        let remaining_after_filter = has_rebase;
+
+        // Phase 0: Execute flatten (if any) — must precede filter-repo and rebase.
+        if has_flatten {
+            let flatten_plan = plan(&repo.commits, &flatten_ops);
+            match flatten_plan {
+                Err(e) => {
+                    repo.execute_result = Some(Err(format!("Plan error: {e}")));
+                    return;
+                }
+                Ok(fp) => match gitio_execute_plan(&repo.git, &branch, &fp) {
+                    Err(e) => {
+                        repo.execute_result = Some(Err(format!("{e}")));
+                        return;
+                    }
+                    Ok(flatten_result) => {
+                        if !remaining_after_flatten {
+                            repo.execute_result = Some(Ok(flatten_result));
+                        }
+                        // Re-snapshot after flatten (OIDs changed).
+                        match repo.git.walk_commits(&branch) {
+                            Ok(c) => repo.commits = c,
+                            Err(e) => {
+                                repo.execute_result =
+                                    Some(Err(format!("Failed to reload after flatten: {e}")));
+                                return;
+                            }
+                        }
+                        if !remaining_after_flatten {
+                            self.reset_draft_state();
+                            return;
+                        }
+                    }
+                },
+            }
+        }
 
         // Phase 1: Execute filter-repo (if any).
         if has_filter {
@@ -266,8 +318,8 @@ impl App {
                         return;
                     }
                     Ok(filter_result) => {
-                        if !has_rebase {
-                            // Only filter-repo, no rebase needed.
+                        if !remaining_after_filter {
+                            // Only filter-repo (and maybe flatten before it), no rebase needed.
                             repo.execute_result = Some(Ok(filter_result));
                         }
                         // Re-snapshot after filter-repo (OIDs changed).
@@ -280,7 +332,7 @@ impl App {
                             }
                         }
                         // If there are no rebase ops, we're done. Save the filter result.
-                        if !has_rebase {
+                        if !remaining_after_filter {
                             self.reset_draft_state();
                             return;
                         }
@@ -514,6 +566,21 @@ impl eframe::App for App {
                             let label = if is_dropped { "↺ Undrop" } else { "🗑 Drop" };
                             if ui.button(label).clicked() {
                                 draft_msg = Some(DraftMsg::ToggleDrop(id.clone()));
+                            }
+
+                            // Flatten button — only shown for merge commits.
+                            if repo.commits[idx].is_merge() {
+                                let is_flattened = repo.draft.ops.iter().any(|op| {
+                                    matches!(op, gunk_core::Operation::FlattenMerge { merge } if *merge == id)
+                                });
+                                let flatten_label = if is_flattened {
+                                    "↺ Unflatten"
+                                } else {
+                                    "⑂ Flatten merge"
+                                };
+                                if ui.button(flatten_label).clicked() {
+                                    draft_msg = Some(DraftMsg::ToggleFlatten(id.clone()));
+                                }
                             }
                         });
                         ui.collapsing("Reword", |ui| {
