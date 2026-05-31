@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gunk_core::{CommitId, RebaseTodo, RebaseTodoLine};
+use gunk_core::{CommitId, FilterRepoSpec, RebaseTodo, RebaseTodoLine};
 use thiserror::Error;
 
 use crate::git::{Git, GitError};
@@ -41,6 +41,12 @@ pub enum ExecuteError {
 
     #[error("unsupported plan type for execution: {0}")]
     Unsupported(String),
+
+    #[error("git-filter-repo failed: {0}")]
+    FilterRepoFailed(String),
+
+    #[error("git-filter-repo is not installed")]
+    FilterRepoNotInstalled,
 }
 
 // ── Result of execution ────────────────────────────────────────────
@@ -496,6 +502,230 @@ fn create_seq_editor_script(
     // For the editor command, also use forward slashes.
     let editor_cmd = script_path.to_str().unwrap_or("").replace('\\', "/");
     Ok((script_path, editor_cmd))
+}
+
+// ── git-filter-repo detection ──────────────────────────────────────
+
+/// Check whether `git-filter-repo` is available.
+///
+/// Returns `true` if `git filter-repo --version` succeeds, `false` otherwise.
+pub fn has_filter_repo(git: &Git) -> bool {
+    git.run(["filter-repo", "--version"]).is_ok()
+}
+
+// ── filter-repo execution ──────────────────────────────────────────
+
+/// Execute a filter-repo plan against a branch.
+///
+/// This follows the same safety protocol as `execute_rebase`:
+/// 1. Check for dirty tree.
+/// 2. Create a backup ref.
+/// 3. Run `git filter-repo --invert-paths` with the specified paths.
+/// 4. Optionally append removed paths to `.gitignore`.
+///
+/// Note: `git filter-repo` requires `--force` when run on a repo that is not
+/// freshly cloned.
+pub fn execute_filter_repo(
+    git: &Git,
+    branch: &str,
+    spec: &FilterRepoSpec,
+) -> Result<ExecuteResult, ExecuteError> {
+    // 1. Dirty tree check.
+    check_clean(git)?;
+
+    // 2. Backup ref.
+    let backup_ref = create_backup_ref(git, branch)?;
+
+    // Build filter-repo arguments.
+    let mut args: Vec<String> = vec![
+        "filter-repo".to_string(),
+        "--invert-paths".to_string(),
+        "--force".to_string(),
+        // Scope to the target branch only. This puts filter-repo in "partial"
+        // mode, which skips GC and leaves other refs (including our backup refs)
+        // untouched, preserving the old commit objects.
+        "--refs".to_string(),
+        format!("refs/heads/{branch}"),
+    ];
+
+    for path in &spec.paths {
+        // Use --path-glob for patterns with wildcards, --path for exact paths.
+        if path.0.contains('*') || path.0.contains('?') || path.0.contains('[') {
+            args.push("--path-glob".to_string());
+        } else {
+            args.push("--path".to_string());
+        }
+        args.push(path.0.clone());
+    }
+
+    // Run filter-repo.
+    let result = git.run(args.iter().map(|s| s.as_str()));
+
+    match result {
+        Ok(_) => {
+            // Optionally append to .gitignore.
+            if spec.add_to_gitignore {
+                append_to_gitignore(git, branch, &spec.paths)?;
+            }
+
+            // Get the new tip.
+            let new_tip = git
+                .run(["rev-parse", branch])
+                .map(|o| o.stdout.trim().to_string())
+                .unwrap_or_default();
+
+            // Check for pushed commits.
+            let old_tip = git
+                .run(["rev-parse", &backup_ref])
+                .map(|o| o.stdout.trim().to_string())
+                .unwrap_or_default();
+            let pushed_commits = check_pushed_commits(git, &[&old_tip]).unwrap_or_default();
+
+            Ok(ExecuteResult {
+                backup_ref,
+                new_tip,
+                branch: branch.to_string(),
+                pushed_commits,
+            })
+        }
+        Err(e) => {
+            // filter-repo failed. Restore from backup.
+            let _ = restore_backup(git, branch, &backup_ref);
+            Err(ExecuteError::FilterRepoFailed(e.to_string()))
+        }
+    }
+}
+
+/// Append paths to `.gitignore` and commit the change.
+fn append_to_gitignore(
+    git: &Git,
+    _branch: &str,
+    paths: &[gunk_core::PathSpec],
+) -> Result<(), ExecuteError> {
+    let gitignore_path = git.repo_path().join(".gitignore");
+
+    // Read existing content (if any).
+    let mut content = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
+
+    // Ensure trailing newline before appending.
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+
+    // Append each path on its own line, escaping gitignore-special chars.
+    content.push_str("\n# Removed from history by gunk\n");
+    for path in paths {
+        let escaped = escape_gitignore_path(&path.0);
+        content.push_str(&escaped);
+        content.push('\n');
+    }
+
+    std::fs::write(&gitignore_path, &content)
+        .map_err(|e| ExecuteError::FilterRepoFailed(format!("failed to write .gitignore: {e}")))?;
+
+    // Stage and commit.
+    git.run(["add", ".gitignore"])?;
+    git.run([
+        "commit",
+        "-m",
+        "chore: add removed paths to .gitignore",
+        "--allow-empty",
+    ])?;
+
+    Ok(())
+}
+
+/// Escape a file path for safe inclusion in `.gitignore`.
+///
+/// Leading `#` and `!` have special meaning in gitignore; backslash-escape them.
+/// Spaces at line boundaries also need escaping.
+fn escape_gitignore_path(path: &str) -> String {
+    let mut s = path.to_string();
+    if s.starts_with('#') || s.starts_with('!') {
+        s.insert(0, '\\');
+    }
+    if s.ends_with(' ') {
+        // Trailing space must be escaped.
+        s.truncate(s.len() - 1);
+        s.push_str("\\ ");
+    }
+    s
+}
+
+// ── Composite plan execution ───────────────────────────────────────
+
+/// Execute a full `ExecutionPlan`, handling all plan types including composites.
+///
+/// For composite plans, execution order matters:
+/// 1. FilterRepo runs first (rewrites entire history).
+/// 2. Rebase runs afterward (OIDs change after filter-repo, so the caller
+///    should re-snapshot and re-plan if combining filter-repo with rebase).
+pub fn execute_plan(
+    git: &Git,
+    branch: &str,
+    exec_plan: &gunk_core::ExecutionPlan,
+) -> Result<ExecuteResult, ExecuteError> {
+    match exec_plan {
+        gunk_core::ExecutionPlan::Rebase(todo) => execute_rebase(git, branch, todo),
+        gunk_core::ExecutionPlan::FilterRepo(spec) => execute_filter_repo(git, branch, spec),
+        gunk_core::ExecutionPlan::Flatten(_) => Err(ExecuteError::Unsupported(
+            "Flatten plans are not yet supported (Phase 7)".into(),
+        )),
+        gunk_core::ExecutionPlan::Composite(plans) => execute_composite(git, branch, plans),
+    }
+}
+
+/// Execute a composite plan (multiple sub-plans in order).
+///
+/// Creates a single backup ref for the entire composite. If any sub-plan
+/// fails, restores from the initial backup.
+fn execute_composite(
+    git: &Git,
+    branch: &str,
+    plans: &[gunk_core::ExecutionPlan],
+) -> Result<ExecuteResult, ExecuteError> {
+    if plans.is_empty() {
+        return Err(ExecuteError::Unsupported("empty composite plan".into()));
+    }
+
+    // 1. Dirty tree check (once for the whole composite).
+    check_clean(git)?;
+
+    // 2. Create a single backup ref for the entire composite.
+    let backup_ref = create_backup_ref(git, branch)?;
+
+    let mut last_result: Option<ExecuteResult> = None;
+
+    for sub_plan in plans {
+        let sub_result = match sub_plan {
+            gunk_core::ExecutionPlan::Rebase(todo) => execute_rebase(git, branch, todo),
+            gunk_core::ExecutionPlan::FilterRepo(spec) => execute_filter_repo(git, branch, spec),
+            gunk_core::ExecutionPlan::Flatten(_) => Err(ExecuteError::Unsupported(
+                "Flatten not yet supported".into(),
+            )),
+            gunk_core::ExecutionPlan::Composite(inner) => execute_composite(git, branch, inner),
+        };
+
+        match sub_result {
+            Ok(result) => {
+                last_result = Some(result);
+            }
+            Err(e) => {
+                // Restore from the composite backup.
+                let _ = restore_backup(git, branch, &backup_ref);
+                return Err(e);
+            }
+        }
+    }
+
+    // Return the composite result with the original (top-level) backup ref.
+    let final_result = last_result.unwrap();
+    Ok(ExecuteResult {
+        backup_ref,
+        new_tip: final_result.new_tip,
+        branch: final_result.branch,
+        pushed_commits: final_result.pushed_commits,
+    })
 }
 
 /// Check if commits are reachable from any remote-tracking ref (pushed history warning).
