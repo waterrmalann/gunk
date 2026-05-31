@@ -2,12 +2,13 @@ use std::path::PathBuf;
 
 use eframe::egui;
 use gunk_core::{
-    ChangeStatus, Commit, CommitId, DraftMsg, DraftState, Identity, PathChange, PreviewRow,
-    RowStatus, SearchHit, SelectionMsg, SelectionState, plan, preview, search_commits,
+    ChangeStatus, Commit, CommitId, DraftMsg, DraftState, Identity, PathChange, PathSpec,
+    PreviewRow, RowStatus, SearchHit, SelectionMsg, SelectionState, plan, preview, search_commits,
     search_hit_indices,
 };
 use gunk_gitio::{
-    BranchInfo, ExecuteResult, Git, execute_rebase, list_backup_refs, restore_backup,
+    BranchInfo, ExecuteResult, Git, execute_plan as gitio_execute_plan, has_filter_repo,
+    list_backup_refs, restore_backup,
 };
 use std::collections::HashMap;
 
@@ -65,6 +66,12 @@ struct RepoState {
     show_restore_panel: bool,
     /// Cached backup refs for the current branch.
     backup_refs: Vec<(String, String)>,
+    /// Whether git-filter-repo is available (gates file removal feature).
+    filter_repo_available: bool,
+    /// Files selected for removal from history (paths toggled via checkboxes).
+    files_selected_for_removal: std::collections::BTreeSet<String>,
+    /// Whether to add removed files to .gitignore.
+    add_to_gitignore: bool,
 }
 
 struct CommitDetail {
@@ -99,6 +106,7 @@ impl App {
                         }
                     };
                     let selection = SelectionState::new(commits.len());
+                    let filter_repo_available = has_filter_repo(&git);
                     self.repo = Some(RepoState {
                         git,
                         branches,
@@ -120,6 +128,9 @@ impl App {
                         execute_result: None,
                         show_restore_panel: false,
                         backup_refs: Vec::new(),
+                        filter_repo_available,
+                        files_selected_for_removal: std::collections::BTreeSet::new(),
+                        add_to_gitignore: false,
                     });
                 }
                 Err(e) => self.error = Some(format!("Failed to list branches: {e}")),
@@ -213,51 +224,116 @@ impl App {
     }
 
     /// Execute the current draft plan against the repository.
+    ///
+    /// For composite plans (e.g., RemovePaths + Reword), this handles the
+    /// filter-repo → re-snapshot → rebase pipeline: filter-repo rewrites all
+    /// OIDs, so the rebase todo must be re-derived from the fresh snapshot.
     fn execute_plan(&mut self) {
         let Some(repo) = &mut self.repo else { return };
 
         let branch = repo.branches[repo.selected_branch].name.clone();
-        let result = plan(&repo.commits, &repo.draft.ops);
 
-        match result {
-            Err(e) => {
-                repo.execute_result = Some(Err(format!("Plan error: {e}")));
-            }
-            Ok(gunk_core::ExecutionPlan::Rebase(todo)) => {
-                match execute_rebase(&repo.git, &branch, &todo) {
-                    Ok(exec_result) => {
-                        repo.execute_result = Some(Ok(exec_result));
-                        // Reset draft and reload commits.
-                        repo.draft = DraftState::new();
-                        repo.preview_rows.clear();
-                        repo.plan_error = None;
-                        repo.selection = SelectionState::new(0);
-                        repo.detail = None;
-                        repo.search_query.clear();
-                        repo.search_hits.clear();
-                        repo.search_match_indices.clear();
-                        repo.reword_summary.clear();
-                        repo.reword_body.clear();
-                        repo.author_name.clear();
-                        repo.author_email.clear();
+        // Separate operations into filter-repo and rebase groups.
+        let filter_ops: Vec<_> = repo
+            .draft
+            .ops
+            .iter()
+            .filter(|op| matches!(op, gunk_core::Operation::RemovePaths { .. }))
+            .cloned()
+            .collect();
+        let rebase_ops: Vec<_> = repo
+            .draft
+            .ops
+            .iter()
+            .filter(|op| !matches!(op, gunk_core::Operation::RemovePaths { .. }))
+            .cloned()
+            .collect();
+
+        let has_filter = !filter_ops.is_empty();
+        let has_rebase = !rebase_ops.is_empty();
+
+        // Phase 1: Execute filter-repo (if any).
+        if has_filter {
+            let filter_plan = plan(&repo.commits, &filter_ops);
+            match filter_plan {
+                Err(e) => {
+                    repo.execute_result = Some(Err(format!("Plan error: {e}")));
+                    return;
+                }
+                Ok(fp) => match gitio_execute_plan(&repo.git, &branch, &fp) {
+                    Err(e) => {
+                        repo.execute_result = Some(Err(format!("{e}")));
+                        return;
+                    }
+                    Ok(filter_result) => {
+                        if !has_rebase {
+                            // Only filter-repo, no rebase needed.
+                            repo.execute_result = Some(Ok(filter_result));
+                        }
+                        // Re-snapshot after filter-repo (OIDs changed).
                         match repo.git.walk_commits(&branch) {
-                            Ok(c) => {
-                                repo.selection = SelectionState::new(c.len());
-                                repo.commits = c;
-                            }
+                            Ok(c) => repo.commits = c,
                             Err(e) => {
-                                self.error = Some(format!("Failed to reload commits: {e}"));
+                                repo.execute_result =
+                                    Some(Err(format!("Failed to reload after filter-repo: {e}")));
+                                return;
                             }
                         }
+                        // If there are no rebase ops, we're done. Save the filter result.
+                        if !has_rebase {
+                            self.reset_draft_state();
+                            return;
+                        }
+                    }
+                },
+            }
+        }
+
+        // Phase 2: Execute rebase ops (against fresh or original snapshot).
+        if has_rebase {
+            let rebase_plan = plan(&repo.commits, &rebase_ops);
+            match rebase_plan {
+                Err(e) => {
+                    repo.execute_result = Some(Err(format!("Plan error: {e}")));
+                }
+                Ok(rp) => match gitio_execute_plan(&repo.git, &branch, &rp) {
+                    Ok(exec_result) => {
+                        repo.execute_result = Some(Ok(exec_result));
+                        self.reset_draft_state();
                     }
                     Err(e) => {
                         repo.execute_result = Some(Err(format!("{e}")));
                     }
-                }
+                },
             }
-            Ok(_) => {
-                repo.execute_result =
-                    Some(Err("Only rebase plans are supported in this phase.".into()));
+        }
+    }
+
+    /// Reset draft state and reload commits after successful execution.
+    fn reset_draft_state(&mut self) {
+        let Some(repo) = &mut self.repo else { return };
+        let branch = repo.branches[repo.selected_branch].name.clone();
+        repo.draft = DraftState::new();
+        repo.preview_rows.clear();
+        repo.plan_error = None;
+        repo.selection = SelectionState::new(0);
+        repo.detail = None;
+        repo.search_query.clear();
+        repo.search_hits.clear();
+        repo.search_match_indices.clear();
+        repo.reword_summary.clear();
+        repo.reword_body.clear();
+        repo.author_name.clear();
+        repo.author_email.clear();
+        repo.files_selected_for_removal.clear();
+        repo.add_to_gitignore = false;
+        match repo.git.walk_commits(&branch) {
+            Ok(c) => {
+                repo.selection = SelectionState::new(c.len());
+                repo.commits = c;
+            }
+            Err(e) => {
+                self.error = Some(format!("Failed to reload commits: {e}"));
             }
         }
     }
@@ -478,6 +554,57 @@ impl eframe::App for App {
                         let commit = &repo.commits[idx];
                         if let Some(detail) = &repo.detail {
                             render_detail(ui, commit, detail);
+
+                            // File removal UI (gated on filter-repo availability).
+                            if repo.filter_repo_available && !detail.changed_paths.is_empty() {
+                                ui.separator();
+                                ui.collapsing("🗑 Remove files from history", |ui| {
+                                    ui.label("Select files to remove from all history:");
+                                    for change in &detail.changed_paths {
+                                        let mut selected = repo
+                                            .files_selected_for_removal
+                                            .contains(&change.path);
+                                        if ui.checkbox(&mut selected, &change.path).changed() {
+                                            if selected {
+                                                repo.files_selected_for_removal
+                                                    .insert(change.path.clone());
+                                            } else {
+                                                repo.files_selected_for_removal
+                                                    .remove(&change.path);
+                                            }
+                                        }
+                                    }
+                                    ui.checkbox(
+                                        &mut repo.add_to_gitignore,
+                                        "Add to .gitignore",
+                                    );
+                                    let can_apply =
+                                        !repo.files_selected_for_removal.is_empty();
+                                    ui.add_enabled_ui(can_apply, |ui| {
+                                        if ui
+                                            .button("Remove selected from all history")
+                                            .clicked()
+                                        {
+                                            let paths: Vec<PathSpec> = repo
+                                                .files_selected_for_removal
+                                                .iter()
+                                                .map(|p| PathSpec(p.clone()))
+                                                .collect();
+                                            draft_msg = Some(DraftMsg::RemovePaths {
+                                                paths,
+                                                add_to_gitignore: repo.add_to_gitignore,
+                                            });
+                                            repo.files_selected_for_removal.clear();
+                                        }
+                                    });
+                                });
+                            } else if !repo.filter_repo_available {
+                                ui.separator();
+                                ui.colored_label(
+                                    egui::Color32::GRAY,
+                                    "ℹ Install git-filter-repo to enable file removal from history.",
+                                );
+                            }
                         }
                     } else if sel_len > 1 {
                         // Bulk actions over the selected set. The oldest commit
