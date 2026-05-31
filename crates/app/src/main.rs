@@ -735,19 +735,18 @@ impl eframe::App for App {
             if let Some(repo) = &self.repo {
                 let searching = !repo.search_query.is_empty();
 
-                // Original index of each commit, for selection/search lookups.
-                let index_by_id: HashMap<&CommitId, usize> = repo
-                    .commits
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| (&c.id, i))
-                    .collect();
-
                 // Iterate in projected order when a draft has produced preview
                 // rows (reorder-aware); otherwise use the original commit order.
                 let order: Vec<(usize, Option<&PreviewRow>)> = if repo.preview_rows.is_empty() {
                     (0..repo.commits.len()).map(|i| (i, None)).collect()
                 } else {
+                    // Original index of each commit, for the reorder-aware lookup.
+                    let index_by_id: HashMap<&CommitId, usize> = repo
+                        .commits
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| (&c.id, i))
+                        .collect();
                     repo.preview_rows
                         .iter()
                         .map(|r| (index_by_id[&r.id], Some(r)))
