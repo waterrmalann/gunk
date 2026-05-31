@@ -3,10 +3,12 @@ use std::path::PathBuf;
 use eframe::egui;
 use gunk_core::{
     ChangeStatus, Commit, CommitId, DraftMsg, DraftState, Identity, PathChange, PreviewRow,
-    RowStatus, SearchHit, SelectionMsg, SelectionState, preview, search_commits,
+    RowStatus, SearchHit, SelectionMsg, SelectionState, plan, preview, search_commits,
     search_hit_indices,
 };
-use gunk_gitio::{BranchInfo, Git};
+use gunk_gitio::{
+    BranchInfo, ExecuteResult, Git, execute_rebase, list_backup_refs, restore_backup,
+};
 use std::collections::HashMap;
 
 fn main() -> eframe::Result {
@@ -55,6 +57,14 @@ struct RepoState {
     author_name: String,
     /// Edit buffer for the author email (set-author).
     author_email: String,
+    /// Whether the confirmation dialog is visible.
+    show_confirm_dialog: bool,
+    /// Result of the last plan execution (success or error message).
+    execute_result: Option<Result<ExecuteResult, String>>,
+    /// Whether the restore-from-backup panel is open.
+    show_restore_panel: bool,
+    /// Cached backup refs for the current branch.
+    backup_refs: Vec<(String, String)>,
 }
 
 struct CommitDetail {
@@ -106,6 +116,10 @@ impl App {
                         reword_body: String::new(),
                         author_name: String::new(),
                         author_email: String::new(),
+                        show_confirm_dialog: false,
+                        execute_result: None,
+                        show_restore_panel: false,
+                        backup_refs: Vec::new(),
                     });
                 }
                 Err(e) => self.error = Some(format!("Failed to list branches: {e}")),
@@ -195,6 +209,93 @@ impl App {
                 repo.search_hits = search_commits(&repo.commits, &repo.search_query);
                 repo.search_match_indices = search_hit_indices(&repo.search_hits);
             }
+        }
+    }
+
+    /// Execute the current draft plan against the repository.
+    fn execute_plan(&mut self) {
+        let Some(repo) = &mut self.repo else { return };
+
+        let branch = repo.branches[repo.selected_branch].name.clone();
+        let result = plan(&repo.commits, &repo.draft.ops);
+
+        match result {
+            Err(e) => {
+                repo.execute_result = Some(Err(format!("Plan error: {e}")));
+            }
+            Ok(gunk_core::ExecutionPlan::Rebase(todo)) => {
+                match execute_rebase(&repo.git, &branch, &todo) {
+                    Ok(exec_result) => {
+                        repo.execute_result = Some(Ok(exec_result));
+                        // Reset draft and reload commits.
+                        repo.draft = DraftState::new();
+                        repo.preview_rows.clear();
+                        repo.plan_error = None;
+                        repo.selection = SelectionState::new(0);
+                        repo.detail = None;
+                        repo.search_query.clear();
+                        repo.search_hits.clear();
+                        repo.search_match_indices.clear();
+                        repo.reword_summary.clear();
+                        repo.reword_body.clear();
+                        repo.author_name.clear();
+                        repo.author_email.clear();
+                        match repo.git.walk_commits(&branch) {
+                            Ok(c) => {
+                                repo.selection = SelectionState::new(c.len());
+                                repo.commits = c;
+                            }
+                            Err(e) => {
+                                self.error = Some(format!("Failed to reload commits: {e}"));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        repo.execute_result = Some(Err(format!("{e}")));
+                    }
+                }
+            }
+            Ok(_) => {
+                repo.execute_result =
+                    Some(Err("Only rebase plans are supported in this phase.".into()));
+            }
+        }
+    }
+
+    /// Load backup refs for the current branch.
+    fn load_backup_refs(&mut self) {
+        if let Some(repo) = &mut self.repo {
+            let branch = &repo.branches[repo.selected_branch].name;
+            match list_backup_refs(&repo.git, branch) {
+                Ok(refs) => repo.backup_refs = refs,
+                Err(e) => self.error = Some(format!("Failed to list backups: {e}")),
+            }
+        }
+    }
+
+    /// Restore the current branch from a backup ref.
+    fn restore_from_backup(&mut self, backup_ref: &str) {
+        let Some(repo) = &mut self.repo else { return };
+
+        let branch = repo.branches[repo.selected_branch].name.clone();
+        match restore_backup(&repo.git, &branch, backup_ref) {
+            Ok(()) => {
+                // Reload commits after restore.
+                repo.draft = DraftState::new();
+                repo.preview_rows.clear();
+                repo.plan_error = None;
+                repo.selection = SelectionState::new(0);
+                repo.detail = None;
+                repo.execute_result = None;
+                match repo.git.walk_commits(&branch) {
+                    Ok(c) => {
+                        repo.selection = SelectionState::new(c.len());
+                        repo.commits = c;
+                    }
+                    Err(e) => self.error = Some(format!("Failed to reload commits: {e}")),
+                }
+            }
+            Err(e) => self.error = Some(format!("Restore failed: {e}")),
         }
     }
 }
@@ -468,21 +569,165 @@ impl eframe::App for App {
 
         // Bottom draft bar
         let mut clear_draft = false;
+        let mut request_confirm = false;
+        let mut request_restore_panel = false;
+
         if let Some(repo) = &self.repo
-            && (!repo.draft.is_empty() || repo.plan_error.is_some())
+            && (!repo.draft.is_empty()
+                || repo.plan_error.is_some()
+                || repo.execute_result.is_some())
         {
             egui::TopBottomPanel::bottom("draft_bar").show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(format!("{} draft operation(s)", repo.draft.len()));
-                    if ui.button("Discard all drafts").clicked() {
-                        clear_draft = true;
+                    if !repo.draft.is_empty() {
+                        ui.label(format!("{} draft operation(s)", repo.draft.len()));
+                        if ui.button("Discard all drafts").clicked() {
+                            clear_draft = true;
+                        }
+                        if repo.plan_error.is_none()
+                            && ui
+                                .button(
+                                    egui::RichText::new("✓ Confirm & Apply")
+                                        .color(egui::Color32::from_rgb(80, 200, 80)),
+                                )
+                                .clicked()
+                        {
+                            request_confirm = true;
+                        }
+                    }
+                    if ui.button("↻ Restore from backup").clicked() {
+                        request_restore_panel = true;
                     }
                     if let Some(err) = &repo.plan_error {
                         ui.separator();
                         ui.colored_label(egui::Color32::RED, format!("⚠ invalid draft: {err}"));
                     }
                 });
+
+                // Show execution result inline.
+                if let Some(result) = &repo.execute_result {
+                    match result {
+                        Ok(r) => {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(80, 200, 80),
+                                format!(
+                                    "✓ Applied successfully. Backup: {}  New tip: {}",
+                                    &r.backup_ref,
+                                    &r.new_tip[..7.min(r.new_tip.len())]
+                                ),
+                            );
+                            if !r.pushed_commits.is_empty() {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(255, 200, 50),
+                                    format!(
+                                        "⚠ {} commit(s) were reachable from remote-tracking refs (published history rewritten)",
+                                        r.pushed_commits.len()
+                                    ),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            ui.colored_label(egui::Color32::RED, format!("✗ Execution failed: {e}"));
+                        }
+                    }
+                }
             });
+        }
+
+        // Confirmation dialog (modal-style window)
+        if let Some(repo) = &self.repo
+            && repo.show_confirm_dialog
+        {
+            let draft_count = repo.draft.len();
+            let branch = repo.branches[repo.selected_branch].name.clone();
+            let mut do_execute = false;
+            let mut cancel_confirm = false;
+
+            egui::Window::new("Confirm Apply")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("⚠ This will rewrite the branch history. This cannot be undone automatically (but a backup ref will be created).");
+                    ui.add_space(8.0);
+                    ui.label(format!("Branch: {branch}"));
+                    ui.label(format!("Operations: {draft_count}"));
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            cancel_confirm = true;
+                        }
+                        if ui
+                            .button(
+                                egui::RichText::new("Apply")
+                                    .color(egui::Color32::from_rgb(80, 200, 80)),
+                            )
+                            .clicked()
+                        {
+                            do_execute = true;
+                        }
+                    });
+                });
+
+            if cancel_confirm && let Some(repo) = &mut self.repo {
+                repo.show_confirm_dialog = false;
+            }
+            if do_execute {
+                if let Some(repo) = &mut self.repo {
+                    repo.show_confirm_dialog = false;
+                }
+                self.execute_plan();
+            }
+        }
+
+        // Restore from backup panel
+        if let Some(repo) = &self.repo
+            && repo.show_restore_panel
+        {
+            let mut close_panel = false;
+            let mut restore_ref: Option<String> = None;
+
+            egui::Window::new("Restore from Backup")
+                .collapsible(false)
+                .resizable(true)
+                .default_width(500.0)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    let branch = &repo.branches[repo.selected_branch].name;
+                    ui.label(format!("Backups for branch: {branch}"));
+                    ui.separator();
+
+                    if repo.backup_refs.is_empty() {
+                        ui.label("No backup refs found for this branch.");
+                    } else {
+                        for (ref_name, oid) in &repo.backup_refs {
+                            ui.horizontal(|ui| {
+                                let short_oid = &oid[..7.min(oid.len())];
+                                // Extract timestamp from ref name.
+                                let ts = ref_name.rsplit('/').next().unwrap_or("?");
+                                ui.label(format!("{ts}  →  {short_oid}"));
+                                if ui.button("Restore").clicked() {
+                                    restore_ref = Some(ref_name.clone());
+                                }
+                            });
+                        }
+                    }
+
+                    ui.separator();
+                    if ui.button("Close").clicked() {
+                        close_panel = true;
+                    }
+                });
+
+            if close_panel && let Some(repo) = &mut self.repo {
+                repo.show_restore_panel = false;
+            }
+            if let Some(ref_name) = restore_ref {
+                if let Some(repo) = &mut self.repo {
+                    repo.show_restore_panel = false;
+                }
+                self.restore_from_backup(&ref_name);
+            }
         }
 
         // Commit list (main area)
@@ -539,6 +784,18 @@ impl eframe::App for App {
 
         if clear_draft {
             self.apply_draft_msg(DraftMsg::Clear);
+            if let Some(repo) = &mut self.repo {
+                repo.execute_result = None;
+            }
+        }
+        if request_confirm && let Some(repo) = &mut self.repo {
+            repo.show_confirm_dialog = true;
+        }
+        if request_restore_panel {
+            self.load_backup_refs();
+            if let Some(repo) = &mut self.repo {
+                repo.show_restore_panel = true;
+            }
         }
         if let Some(msg) = draft_msg {
             self.apply_draft_msg(msg);
