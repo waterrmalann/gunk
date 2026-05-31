@@ -244,8 +244,20 @@ fn execute_rebase_squashes_commits() {
     let new_commits = git.walk_commits("main").unwrap();
     assert_eq!(new_commits.len(), 2);
     assert_eq!(new_commits[0].summary, "third");
-    // The squashed commit should contain both messages.
-    // (git's default squash behavior combines messages.)
+
+    // The squashed commit must retain both source messages (git's default
+    // squash combines them). The kept commit's summary leads; the absorbed
+    // message survives in the combined body.
+    let squashed = &new_commits[1];
+    let full_message = format!("{}\n{}", squashed.summary, squashed.body);
+    assert!(
+        full_message.contains("first"),
+        "squashed message should contain kept message 'first', got: {full_message:?}"
+    );
+    assert!(
+        full_message.contains("second"),
+        "squashed message should contain absorbed message 'second', got: {full_message:?}"
+    );
 }
 
 #[test]
@@ -497,7 +509,39 @@ fn worktree_is_cleaned_up_on_failure() {
         _ => panic!("expected rebase plan"),
     };
 
-    let _ = execute_rebase(&git, "main", &todo); // may fail
+    // All three commits touch the same file, so reordering them must conflict.
+    let original_tip = git
+        .run(["rev-parse", "main"])
+        .unwrap()
+        .stdout
+        .trim()
+        .to_string();
+    let result = execute_rebase(&git, "main", &todo);
+
+    // The rehearsal must fail (otherwise this test asserts nothing meaningful).
+    assert!(
+        result.is_err(),
+        "reordering conflicting commits should fail the rehearsal"
+    );
+
+    // Safety guarantee: the real branch is untouched after a failed rehearsal.
+    let tip_after = git
+        .run(["rev-parse", "main"])
+        .unwrap()
+        .stdout
+        .trim()
+        .to_string();
+    assert_eq!(
+        original_tip, tip_after,
+        "real branch must be untouched when the rehearsal fails"
+    );
+
+    // A backup ref was created before the rehearsal and survives the failure.
+    let backups = list_backup_refs(&git, "main").unwrap();
+    assert!(
+        !backups.is_empty(),
+        "a backup ref should exist even when the rehearsal fails"
+    );
 
     // Worktree directory should not exist regardless.
     let worktree_path = fixture.path().join(".gunk-rehearsal");
@@ -834,6 +878,42 @@ fn execute_rebase_set_author_bulk() {
         assert_eq!(c.author.name, "Bulk Author");
         assert_eq!(c.author.email, "bulk@example.com");
     }
+}
+
+#[test]
+fn execute_rebase_set_author_with_special_characters() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "first", &[("a.txt", "a")]);
+    fixture.commit("c2", "second", &[("b.txt", "b")]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    let commits = git.walk_commits("main").unwrap();
+
+    // The author name flows through an `exec git commit --amend --author=...`
+    // shell line in the rebase todo, so shell-special characters (quotes,
+    // ampersands, dollar signs, spaces) must survive escaping end-to-end.
+    let operations = vec![Operation::SetAuthor {
+        targets: vec![commits[0].id.clone()],
+        author: Identity {
+            name: "O'Brien & \"Co.\" $USER".to_string(),
+            email: "weird+name@example.com".to_string(),
+            time: OffsetDateTime::now_utc(),
+        },
+    }];
+
+    let plan_result = plan(&commits, &operations).unwrap();
+    let todo = match plan_result {
+        ExecutionPlan::Rebase(todo) => todo,
+        _ => panic!("expected rebase plan"),
+    };
+
+    let _result = execute_rebase(&git, "main", &todo).unwrap();
+
+    let new_commits = git.walk_commits("main").unwrap();
+    assert_eq!(new_commits[0].author.name, "O'Brien & \"Co.\" $USER");
+    assert_eq!(new_commits[0].author.email, "weird+name@example.com");
+    // Message should be preserved untouched.
+    assert_eq!(new_commits[0].summary, "second");
 }
 
 // ── Reword with empty body ─────────────────────────────────────────

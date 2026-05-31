@@ -802,6 +802,32 @@ mod prop {
             prop_assert_eq!(plan(&snap, &canonical).unwrap(), plan(&snap, &shuffled).unwrap());
         }
 
+        /// Stronger order-independence: multiple non-conflicting ops that all
+        /// target the *same* commit (reword + set-author touch different axes
+        /// of one commit) must yield an identical plan regardless of input
+        /// order. The distinct-commit variant above cannot catch a builder
+        /// that is sensitive to per-commit op ordering.
+        #[test]
+        fn arbitrary_order_independence_same_commit(
+            order in Just((0..2usize).collect::<Vec<_>>()).prop_shuffle()
+        ) {
+            let snap = arb_linear_snapshot(5);
+            let make = |which: usize| match which {
+                0 => Operation::Reword {
+                    target: snap[2].id.clone(),
+                    summary: "reworded".into(),
+                    body: String::new(),
+                },
+                _ => Operation::SetAuthor {
+                    targets: vec![snap[2].id.clone()],
+                    author: test_identity("Carol"),
+                },
+            };
+            let canonical: Vec<Operation> = (0..2).map(make).collect();
+            let shuffled: Vec<Operation> = order.iter().map(|&w| make(w)).collect();
+            prop_assert_eq!(plan(&snap, &canonical).unwrap(), plan(&snap, &shuffled).unwrap());
+        }
+
         #[test]
         fn drop_reduces_pick_count(drop_idx in 1..4usize) {
             let snap = arb_linear_snapshot(5);
