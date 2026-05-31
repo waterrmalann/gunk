@@ -1,0 +1,15 @@
+---
+source: crates/core/src/plan.rs
+assertion_line: 958
+expression: result
+---
+Rebase:
+  base: ~
+  lines:
+    - Pick: E
+    - Pick: D
+    - Pick: C
+    - Pick: B
+    - Pick: A
+  message_map: []
+  author_map: []

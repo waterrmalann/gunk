@@ -1,0 +1,25 @@
+---
+source: crates/core/src/plan.rs
+assertion_line: 1080
+expression: result
+---
+Composite:
+  - Flatten:
+      merge: M
+      mainline_parent: D
+      message: "Merge branch 'feature'\n\nMerged feature branch"
+  - FilterRepo:
+      paths:
+        - build/
+      add_to_gitignore: true
+  - Rebase:
+      base: ~
+      lines:
+        - Pick: A
+        - Pick: B
+        - Drop: C
+        - Pick: D
+        - Pick: M
+        - Pick: E
+      message_map: []
+      author_map: []

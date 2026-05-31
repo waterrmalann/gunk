@@ -1,0 +1,10 @@
+---
+source: crates/core/src/plan.rs
+assertion_line: 969
+expression: result
+---
+FilterRepo:
+  paths:
+    - secrets.env
+    - "*.log"
+  add_to_gitignore: true

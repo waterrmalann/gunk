@@ -1,0 +1,17 @@
+---
+source: crates/core/src/plan.rs
+assertion_line: 859
+expression: result
+---
+Rebase:
+  base: ~
+  lines:
+    - Pick: A
+    - Pick: B
+    - Reword: C
+    - Pick: D
+    - Pick: E
+  message_map:
+    - - C
+      - "Refactored C\n\nDetailed description"
+  author_map: []

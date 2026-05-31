@@ -1,0 +1,17 @@
+---
+source: crates/core/src/plan.rs
+assertion_line: 1111
+expression: result
+---
+Rebase:
+  base: ~
+  lines:
+    - Reword: A
+    - Pick: B
+    - Pick: C
+    - Pick: D
+    - Pick: E
+  message_map:
+    - - A
+      - Initial commit (reworded)
+  author_map: []

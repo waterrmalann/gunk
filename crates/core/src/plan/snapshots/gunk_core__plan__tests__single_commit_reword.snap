@@ -1,0 +1,13 @@
+---
+source: crates/core/src/plan/tests.rs
+assertion_line: 679
+expression: result
+---
+Rebase:
+  base: ~
+  lines:
+    - Reword: A
+  message_map:
+    - - A
+      - Reworded root
+  author_map: []

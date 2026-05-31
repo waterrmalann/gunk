@@ -1,0 +1,22 @@
+---
+source: crates/core/src/plan.rs
+assertion_line: 997
+expression: result
+---
+Rebase:
+  base: ~
+  lines:
+    - Pick: A
+    - Pick: B
+    - Reword: C
+    - Exec: "git commit --amend --no-edit --author=\"Bob <bob@example.com>\""
+    - Pick: D
+    - Pick: E
+  message_map:
+    - - C
+      - New message
+  author_map:
+    - - C
+      - name: Bob
+        email: bob@example.com
+        time: "+001970-01-01T00:00:00.000000000Z"

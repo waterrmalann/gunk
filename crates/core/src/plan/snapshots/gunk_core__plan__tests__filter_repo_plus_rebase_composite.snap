@@ -1,0 +1,22 @@
+---
+source: crates/core/src/plan.rs
+assertion_line: 1065
+expression: result
+---
+Composite:
+  - FilterRepo:
+      paths:
+        - secrets.env
+      add_to_gitignore: false
+  - Rebase:
+      base: ~
+      lines:
+        - Pick: A
+        - Pick: B
+        - Reword: C
+        - Pick: D
+        - Pick: E
+      message_map:
+        - - C
+          - Updated C
+      author_map: []

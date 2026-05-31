@@ -1,0 +1,17 @@
+---
+source: crates/core/src/plan.rs
+assertion_line: 1015
+expression: result
+---
+Rebase:
+  base: ~
+  lines:
+    - Pick: A
+    - Reword: B
+    - Squash: C
+    - Pick: D
+    - Pick: E
+  message_map:
+    - - B
+      - "Combined B+C\n\nSquashed commit"
+  author_map: []

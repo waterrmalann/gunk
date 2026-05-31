@@ -1,0 +1,19 @@
+---
+source: crates/core/src/plan.rs
+assertion_line: 871
+expression: result
+---
+Rebase:
+  base: ~
+  lines:
+    - Pick: A
+    - Reword: B
+    - Pick: C
+    - Reword: D
+    - Pick: E
+  message_map:
+    - - D
+      - Standardised message
+    - - B
+      - Standardised message
+  author_map: []

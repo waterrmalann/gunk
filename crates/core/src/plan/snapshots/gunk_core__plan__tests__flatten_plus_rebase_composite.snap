@@ -1,0 +1,23 @@
+---
+source: crates/core/src/plan.rs
+assertion_line: 1047
+expression: result
+---
+Composite:
+  - Flatten:
+      merge: M
+      mainline_parent: D
+      message: "Merge branch 'feature'\n\nMerged feature branch"
+  - Rebase:
+      base: ~
+      lines:
+        - Pick: A
+        - Pick: B
+        - Reword: C
+        - Pick: D
+        - Pick: M
+        - Pick: E
+      message_map:
+        - - C
+          - Updated C
+      author_map: []

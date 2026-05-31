@@ -1,0 +1,9 @@
+---
+source: crates/core/src/plan.rs
+assertion_line: 977
+expression: result
+---
+Flatten:
+  merge: M
+  mainline_parent: D
+  message: "Merge branch 'feature'\n\nMerged feature branch"
