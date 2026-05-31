@@ -1,7 +1,10 @@
-use gunk_core::{CommitId, ExecutionPlan, Identity, Operation, RebaseTodo, RebaseTodoLine, plan};
+use gunk_core::{
+    CommitId, ExecutionPlan, FilterRepoSpec, Identity, Operation, PathSpec, RebaseTodo,
+    RebaseTodoLine, plan,
+};
 use gunk_gitio::{
-    Git, check_clean, create_backup_ref, execute_rebase, format_rebase_todo, list_backup_refs,
-    restore_backup, stash_pop, stash_push,
+    Git, check_clean, create_backup_ref, execute_filter_repo, execute_plan, execute_rebase,
+    format_rebase_todo, has_filter_repo, list_backup_refs, restore_backup, stash_pop, stash_push,
 };
 use gunk_testkit::RepoFixture;
 use time::OffsetDateTime;
@@ -1204,4 +1207,439 @@ fn execute_rebase_cleans_up_message_files() {
         !fixture.path().join(".gunk-rehearsal").exists(),
         "worktree should be removed after execution"
     );
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Phase 6 — Remove files from history (git-filter-repo)
+// ════════════════════════════════════════════════════════════════════
+
+// ── Detection ──────────────────────────────────────────────────────
+
+#[test]
+fn has_filter_repo_returns_bool() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "init", &[("f.txt", "x")]);
+    let git = Git::open(fixture.path()).unwrap();
+    // Just verify it returns without panic; the result depends on the system.
+    let _ = has_filter_repo(&git);
+}
+
+// ── Single path removal ───────────────────────────────────────────
+
+#[test]
+fn filter_repo_removes_single_file_from_history() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "add secret", &[("secret.env", "API_KEY=xxx")]);
+    fixture.commit("c2", "add code", &[("main.rs", "fn main() {}")]);
+    fixture.commit(
+        "c3",
+        "update code",
+        &[("main.rs", "fn main() { println!(\"hi\"); }")],
+    );
+
+    let git = Git::open(fixture.path()).unwrap();
+    if !has_filter_repo(&git) {
+        eprintln!("SKIPPED: git-filter-repo not installed");
+        return;
+    }
+
+    let spec = FilterRepoSpec {
+        paths: vec![PathSpec("secret.env".into())],
+        add_to_gitignore: false,
+    };
+
+    let result = execute_filter_repo(&git, "main", &spec).unwrap();
+
+    // Backup ref should exist.
+    assert!(result.backup_ref.starts_with("refs/gunk/backup/main/"));
+
+    // The file should not exist in the working tree.
+    assert!(
+        !fixture.path().join("secret.env").exists(),
+        "secret.env should be removed from working tree"
+    );
+
+    // The file should not appear in the branch's history.
+    let log = fixture.git(["log", "main", "--diff-filter=A", "--name-only", "--format="]);
+    assert!(
+        !log.contains("secret.env"),
+        "secret.env should not appear in branch history, got: {log}"
+    );
+
+    // main.rs should still exist.
+    assert!(fixture.path().join("main.rs").exists());
+}
+
+// ── Glob pattern removal ──────────────────────────────────────────
+
+#[test]
+fn filter_repo_removes_glob_pattern() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit(
+        "c1",
+        "add logs",
+        &[("app.log", "log1"), ("debug.log", "log2")],
+    );
+    fixture.commit("c2", "add code", &[("main.rs", "fn main() {}")]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    if !has_filter_repo(&git) {
+        eprintln!("SKIPPED: git-filter-repo not installed");
+        return;
+    }
+
+    let spec = FilterRepoSpec {
+        paths: vec![PathSpec("*.log".into())],
+        add_to_gitignore: false,
+    };
+
+    let result = execute_filter_repo(&git, "main", &spec).unwrap();
+    assert!(result.backup_ref.starts_with("refs/gunk/backup/main/"));
+
+    // Log files should be gone.
+    assert!(!fixture.path().join("app.log").exists());
+    assert!(!fixture.path().join("debug.log").exists());
+
+    // Code should remain.
+    assert!(fixture.path().join("main.rs").exists());
+}
+
+// ── Path that exists only in old commits ──────────────────────────
+
+#[test]
+fn filter_repo_removes_file_deleted_in_later_commit() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "add temp file", &[("temp.dat", "temporary data")]);
+    fixture.commit("c2", "add code", &[("main.rs", "fn main() {}")]);
+    // Delete the file in c3 — but it's still in history.
+    std::fs::remove_file(fixture.path().join("temp.dat")).unwrap();
+    fixture.git(["add", "-A"]);
+    fixture.commit("c3", "clean up", &[]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    if !has_filter_repo(&git) {
+        eprintln!("SKIPPED: git-filter-repo not installed");
+        return;
+    }
+
+    let spec = FilterRepoSpec {
+        paths: vec![PathSpec("temp.dat".into())],
+        add_to_gitignore: false,
+    };
+
+    let _result = execute_filter_repo(&git, "main", &spec).unwrap();
+
+    // File should not appear in the branch's history.
+    let log = fixture.git(["log", "main", "--diff-filter=A", "--name-only", "--format="]);
+    assert!(
+        !log.contains("temp.dat"),
+        "temp.dat should be purged from branch history"
+    );
+}
+
+// ── Binary file removal ───────────────────────────────────────────
+
+#[test]
+fn filter_repo_removes_binary_file() {
+    let mut fixture = RepoFixture::new();
+    // Write some binary content (non-UTF8 bytes).
+    let binary_content = vec![0x00, 0xFF, 0xFE, 0xAB, 0xCD];
+    let binary_path = fixture.path().join("image.bin");
+    std::fs::write(&binary_path, &binary_content).unwrap();
+    fixture.git(["add", "image.bin"]);
+    fixture.commit("c1", "add binary", &[]);
+    fixture.commit("c2", "add code", &[("main.rs", "fn main() {}")]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    if !has_filter_repo(&git) {
+        eprintln!("SKIPPED: git-filter-repo not installed");
+        return;
+    }
+
+    let spec = FilterRepoSpec {
+        paths: vec![PathSpec("image.bin".into())],
+        add_to_gitignore: false,
+    };
+
+    let _result = execute_filter_repo(&git, "main", &spec).unwrap();
+
+    assert!(!fixture.path().join("image.bin").exists());
+}
+
+// ── add_to_gitignore behavior ─────────────────────────────────────
+
+#[test]
+fn filter_repo_appends_to_gitignore_when_requested() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "add secrets", &[("secret.env", "key=val")]);
+    fixture.commit("c2", "add code", &[("main.rs", "fn main() {}")]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    if !has_filter_repo(&git) {
+        eprintln!("SKIPPED: git-filter-repo not installed");
+        return;
+    }
+
+    let spec = FilterRepoSpec {
+        paths: vec![PathSpec("secret.env".into())],
+        add_to_gitignore: true,
+    };
+
+    let _result = execute_filter_repo(&git, "main", &spec).unwrap();
+
+    // .gitignore should exist and contain the removed path.
+    let gitignore = std::fs::read_to_string(fixture.path().join(".gitignore")).unwrap();
+    assert!(
+        gitignore.contains("secret.env"),
+        ".gitignore should contain 'secret.env', got: {gitignore}"
+    );
+
+    // The .gitignore commit should be in history.
+    let log = fixture.log();
+    assert!(
+        log.iter()
+            .any(|(_, msg)| msg.contains("add removed paths to .gitignore")),
+        "should have a gitignore commit, log: {log:?}"
+    );
+}
+
+#[test]
+fn filter_repo_preserves_existing_gitignore_content() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit(
+        "c1",
+        "initial",
+        &[(".gitignore", "target/\n*.tmp\n"), ("secret.env", "x")],
+    );
+    fixture.commit("c2", "add code", &[("main.rs", "fn main() {}")]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    if !has_filter_repo(&git) {
+        eprintln!("SKIPPED: git-filter-repo not installed");
+        return;
+    }
+
+    let spec = FilterRepoSpec {
+        paths: vec![PathSpec("secret.env".into())],
+        add_to_gitignore: true,
+    };
+
+    let _result = execute_filter_repo(&git, "main", &spec).unwrap();
+
+    let gitignore = std::fs::read_to_string(fixture.path().join(".gitignore")).unwrap();
+    // Existing entries should still be present.
+    assert!(gitignore.contains("target/"), "should preserve 'target/'");
+    assert!(gitignore.contains("*.tmp"), "should preserve '*.tmp'");
+    // New entry should also be present.
+    assert!(gitignore.contains("secret.env"), "should add 'secret.env'");
+}
+
+// ── Dirty tree refused ────────────────────────────────────────────
+
+#[test]
+fn filter_repo_refuses_on_dirty_tree() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "init", &[("f.txt", "hello"), ("secret.env", "x")]);
+
+    // Dirty the tree.
+    std::fs::write(fixture.path().join("f.txt"), "modified").unwrap();
+
+    let git = Git::open(fixture.path()).unwrap();
+
+    let spec = FilterRepoSpec {
+        paths: vec![PathSpec("secret.env".into())],
+        add_to_gitignore: false,
+    };
+
+    let err = execute_filter_repo(&git, "main", &spec).unwrap_err();
+    assert!(
+        err.to_string().contains("dirty"),
+        "expected dirty tree error, got: {err}"
+    );
+}
+
+// ── Backup ref exists after filter-repo ───────────────────────────
+
+#[test]
+fn filter_repo_creates_backup_ref() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "add secret", &[("secret.env", "key=val")]);
+    fixture.commit("c2", "add code", &[("main.rs", "fn main() {}")]);
+    let original_tip = fixture.rev_parse("main");
+
+    let git = Git::open(fixture.path()).unwrap();
+    if !has_filter_repo(&git) {
+        eprintln!("SKIPPED: git-filter-repo not installed");
+        return;
+    }
+
+    let spec = FilterRepoSpec {
+        paths: vec![PathSpec("secret.env".into())],
+        add_to_gitignore: false,
+    };
+
+    let result = execute_filter_repo(&git, "main", &spec).unwrap();
+
+    // Backup ref should point at the original tip.
+    let backup_oid = fixture.rev_parse(&result.backup_ref);
+    assert_eq!(backup_oid, original_tip);
+
+    // New tip should be different (history was rewritten).
+    assert_ne!(result.new_tip, original_tip);
+}
+
+// ── Restore from backup after filter-repo ─────────────────────────
+
+#[test]
+fn restore_after_filter_repo() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "add secret", &[("secret.env", "key=val")]);
+    fixture.commit("c2", "add code", &[("main.rs", "fn main() {}")]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    if !has_filter_repo(&git) {
+        eprintln!("SKIPPED: git-filter-repo not installed");
+        return;
+    }
+
+    let original_tip = fixture.rev_parse("main");
+    let original_commits = git.walk_commits("main").unwrap();
+
+    let spec = FilterRepoSpec {
+        paths: vec![PathSpec("secret.env".into())],
+        add_to_gitignore: false,
+    };
+
+    let result = execute_filter_repo(&git, "main", &spec).unwrap();
+
+    // Restore.
+    restore_backup(&git, "main", &result.backup_ref).unwrap();
+
+    // Branch should be back to original.
+    let restored_tip = fixture.rev_parse("main");
+    assert_eq!(restored_tip, original_tip);
+
+    // The file should be back.
+    assert!(fixture.path().join("secret.env").exists());
+
+    // History should be restored.
+    let restored_commits = git.walk_commits("main").unwrap();
+    assert_eq!(restored_commits.len(), original_commits.len());
+}
+
+// ── execute_plan dispatches correctly ─────────────────────────────
+
+#[test]
+fn execute_plan_handles_rebase() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "first", &[("a.txt", "a")]);
+    fixture.commit("c2", "second", &[("b.txt", "b")]);
+    fixture.commit("c3", "third", &[("c.txt", "c")]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    let commits = git.walk_commits("main").unwrap();
+
+    let operations = vec![Operation::Drop {
+        target: commits[1].id.clone(),
+    }];
+    let exec_plan = plan(&commits, &operations).unwrap();
+
+    let result = execute_plan(&git, "main", &exec_plan).unwrap();
+
+    let new_commits = git.walk_commits("main").unwrap();
+    assert_eq!(new_commits.len(), 2);
+    assert!(result.backup_ref.starts_with("refs/gunk/backup/main/"));
+}
+
+#[test]
+fn execute_plan_handles_filter_repo() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "add secret", &[("secret.env", "key=val")]);
+    fixture.commit("c2", "add code", &[("main.rs", "fn main() {}")]);
+
+    let git = Git::open(fixture.path()).unwrap();
+    if !has_filter_repo(&git) {
+        eprintln!("SKIPPED: git-filter-repo not installed");
+        return;
+    }
+
+    let commits = git.walk_commits("main").unwrap();
+    let operations = vec![Operation::RemovePaths {
+        paths: vec![PathSpec("secret.env".into())],
+        add_to_gitignore: false,
+    }];
+
+    let exec_plan = plan(&commits, &operations).unwrap();
+    let result = execute_plan(&git, "main", &exec_plan).unwrap();
+
+    assert!(!fixture.path().join("secret.env").exists());
+    assert!(result.backup_ref.starts_with("refs/gunk/backup/main/"));
+}
+
+// ── Composite: filter-repo only (no rebase) ───────────────────────
+
+#[test]
+fn execute_plan_filter_repo_only_via_plan() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit(
+        "c1",
+        "add secret",
+        &[("secret.env", "key=val"), ("main.rs", "fn main() {}")],
+    );
+
+    let git = Git::open(fixture.path()).unwrap();
+    if !has_filter_repo(&git) {
+        eprintln!("SKIPPED: git-filter-repo not installed");
+        return;
+    }
+
+    let commits = git.walk_commits("main").unwrap();
+    let operations = vec![Operation::RemovePaths {
+        paths: vec![PathSpec("secret.env".into())],
+        add_to_gitignore: true,
+    }];
+
+    let exec_plan = plan(&commits, &operations).unwrap();
+    let result = execute_plan(&git, "main", &exec_plan).unwrap();
+
+    // File removed.
+    assert!(!fixture.path().join("secret.env").exists());
+    // .gitignore updated.
+    let gitignore = std::fs::read_to_string(fixture.path().join(".gitignore")).unwrap();
+    assert!(gitignore.contains("secret.env"));
+    // Backup exists.
+    assert!(result.backup_ref.starts_with("refs/gunk/backup/main/"));
+}
+
+// ── Multiple path removal at once ─────────────────────────────────
+
+#[test]
+fn filter_repo_removes_multiple_paths() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit(
+        "c1",
+        "add files",
+        &[
+            ("secret.env", "key=val"),
+            ("debug.log", "log data"),
+            ("main.rs", "fn main() {}"),
+        ],
+    );
+
+    let git = Git::open(fixture.path()).unwrap();
+    if !has_filter_repo(&git) {
+        eprintln!("SKIPPED: git-filter-repo not installed");
+        return;
+    }
+
+    let spec = FilterRepoSpec {
+        paths: vec![PathSpec("secret.env".into()), PathSpec("debug.log".into())],
+        add_to_gitignore: false,
+    };
+
+    let _result = execute_filter_repo(&git, "main", &spec).unwrap();
+
+    assert!(!fixture.path().join("secret.env").exists());
+    assert!(!fixture.path().join("debug.log").exists());
+    assert!(fixture.path().join("main.rs").exists());
 }
