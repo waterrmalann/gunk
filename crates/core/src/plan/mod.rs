@@ -61,6 +61,118 @@ pub enum ExecutionPlan {
     Composite(Vec<ExecutionPlan>),
 }
 
+/// Maps pre-rewrite commit ids to their post-rewrite ids.
+///
+/// A value of `None` means the commit was dropped by the rewrite (it no longer
+/// exists). Ids absent from the map are assumed unchanged (identity). Produced
+/// by history-rewriting phases (flatten, filter-repo) so that operations planned
+/// against the original snapshot can be retargeted onto the rewritten history.
+pub type OidMap = HashMap<CommitId, Option<CommitId>>;
+
+/// Resolve a commit id through an [`OidMap`]. Returns `CommitNotFound` if the
+/// id was dropped by a preceding rewrite, since an operation can no longer
+/// target it.
+fn remap_required(id: &CommitId, map: &OidMap) -> Result<CommitId, PlanError> {
+    match map.get(id) {
+        Some(Some(new)) => Ok(new.clone()),
+        Some(None) => Err(PlanError::CommitNotFound(id.clone())),
+        None => Ok(id.clone()),
+    }
+}
+
+/// Compose two rewrite maps so that `compose(first, second)` maps original ids
+/// (the domain of `first`) all the way to post-`second` ids.
+///
+/// Ids that were identity through `first` but rewritten by `second` are carried
+/// over, so the result is a complete original→final map across both phases.
+pub fn compose_oid_maps(first: &OidMap, second: &OidMap) -> OidMap {
+    // Start from `second`: covers ids that passed through `first` unchanged.
+    let mut result = second.clone();
+    for (orig, mapped) in first {
+        let final_value = match mapped {
+            // Already dropped in the first phase — stays dropped.
+            None => None,
+            // Survived the first phase as `cur`; apply the second phase to it.
+            Some(cur) => match second.get(cur) {
+                Some(Some(next)) => Some(next.clone()),
+                Some(None) => None,
+                None => Some(cur.clone()),
+            },
+        };
+        result.insert(orig.clone(), final_value);
+    }
+    result
+}
+
+impl ExecutionPlan {
+    /// Retarget every commit id in this plan through `map`.
+    ///
+    /// Used by the executor to thread a rewrite map from one composite phase
+    /// into the next, so a plan built against the original snapshot can run
+    /// against already-rewritten history. Identity maps are a cheap clone.
+    pub fn remap_oids(&self, map: &OidMap) -> Result<ExecutionPlan, PlanError> {
+        if map.is_empty() {
+            return Ok(self.clone());
+        }
+        Ok(match self {
+            ExecutionPlan::FilterRepo(spec) => ExecutionPlan::FilterRepo(spec.clone()),
+            ExecutionPlan::Flatten(spec) => ExecutionPlan::Flatten(FlattenSpec {
+                merge: remap_required(&spec.merge, map)?,
+                mainline_parent: remap_required(&spec.mainline_parent, map)?,
+                message: spec.message.clone(),
+            }),
+            ExecutionPlan::Rebase(todo) => ExecutionPlan::Rebase(remap_rebase_todo(todo, map)?),
+            ExecutionPlan::Composite(plans) => ExecutionPlan::Composite(
+                plans
+                    .iter()
+                    .map(|p| p.remap_oids(map))
+                    .collect::<Result<_, _>>()?,
+            ),
+        })
+    }
+}
+
+fn remap_rebase_todo(todo: &RebaseTodo, map: &OidMap) -> Result<RebaseTodo, PlanError> {
+    let base = match &todo.base {
+        Some(id) => Some(remap_required(id, map)?),
+        None => None,
+    };
+
+    let lines = todo
+        .lines
+        .iter()
+        .map(|line| {
+            Ok(match line {
+                RebaseTodoLine::Pick(id) => RebaseTodoLine::Pick(remap_required(id, map)?),
+                RebaseTodoLine::Reword(id) => RebaseTodoLine::Reword(remap_required(id, map)?),
+                RebaseTodoLine::Squash(id) => RebaseTodoLine::Squash(remap_required(id, map)?),
+                RebaseTodoLine::Fixup(id) => RebaseTodoLine::Fixup(remap_required(id, map)?),
+                RebaseTodoLine::Drop(id) => RebaseTodoLine::Drop(remap_required(id, map)?),
+                RebaseTodoLine::Exec(cmd) => RebaseTodoLine::Exec(cmd.clone()),
+            })
+        })
+        .collect::<Result<_, PlanError>>()?;
+
+    let message_map = todo
+        .message_map
+        .iter()
+        .map(|(id, msg)| Ok((remap_required(id, map)?, msg.clone())))
+        .collect::<Result<_, PlanError>>()?;
+
+    let author_map = todo
+        .author_map
+        .iter()
+        .map(|(id, a)| Ok((remap_required(id, map)?, a.clone())))
+        .collect::<Result<_, PlanError>>()?;
+
+    Ok(RebaseTodo {
+        base,
+        lines,
+        message_map,
+        author_map,
+    })
+}
+
 /// Errors from plan validation.
 #[derive(Debug, Clone, PartialEq, Eq, Error, Serialize, Deserialize)]
 pub enum PlanError {

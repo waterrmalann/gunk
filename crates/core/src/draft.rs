@@ -47,6 +47,8 @@ pub enum DraftMsg {
     },
     /// Toggle a drop for the given commit (add if absent, remove if present).
     ToggleDrop(CommitId),
+    /// Drop many commits at once (idempotent: skips targets already dropped).
+    DropMany(Vec<CommitId>),
     /// Reorder the range. Replaces any existing reorder.
     Reorder { new_order: Vec<CommitId> },
     /// Remove paths from history. Merges with any existing RemovePaths op.
@@ -128,6 +130,16 @@ impl DraftState {
                         ops.remove(idx);
                     }
                     None => ops.push(Operation::Drop { target }),
+                }
+            }
+            DraftMsg::DropMany(targets) => {
+                for target in targets {
+                    let already = ops
+                        .iter()
+                        .any(|op| matches!(op, Operation::Drop { target: t } if *t == target));
+                    if !already {
+                        ops.push(Operation::Drop { target });
+                    }
                 }
             }
             DraftMsg::Reorder { new_order } => {

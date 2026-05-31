@@ -1021,3 +1021,107 @@ fn set_co_authors_bulk_targets() {
         panic!("expected Rebase plan");
     }
 }
+
+// ── OID remap across rewrite phases ────────────────────────────
+
+fn omap(pairs: &[(&str, Option<&str>)]) -> OidMap {
+    pairs
+        .iter()
+        .map(|(k, v)| (cid(k), v.map(cid)))
+        .collect()
+}
+
+#[test]
+fn remap_rebase_todo_retargets_all_ids() {
+    let map = omap(&[("a", Some("A")), ("b", Some("B")), ("c", Some("C"))]);
+    let todo = RebaseTodo {
+        base: Some(cid("a")),
+        lines: vec![
+            RebaseTodoLine::Pick(cid("b")),
+            RebaseTodoLine::Reword(cid("c")),
+            RebaseTodoLine::Exec("git commit --amend".into()),
+        ],
+        message_map: vec![(cid("c"), "msg".into())],
+        author_map: vec![(cid("b"), test_identity("Alice"))],
+    };
+
+    let remapped = ExecutionPlan::Rebase(todo).remap_oids(&map).unwrap();
+    let ExecutionPlan::Rebase(t) = remapped else {
+        panic!("expected Rebase");
+    };
+    assert_eq!(t.base, Some(cid("A")));
+    assert_eq!(t.lines[0], RebaseTodoLine::Pick(cid("B")));
+    assert_eq!(t.lines[1], RebaseTodoLine::Reword(cid("C")));
+    assert_eq!(t.lines[2], RebaseTodoLine::Exec("git commit --amend".into()));
+    assert_eq!(t.message_map[0].0, cid("C"));
+    assert_eq!(t.author_map[0].0, cid("B"));
+}
+
+#[test]
+fn remap_leaves_unmapped_ids_unchanged() {
+    // `b` is not in the map → identity.
+    let map = omap(&[("a", Some("A"))]);
+    let plan = ExecutionPlan::Flatten(FlattenSpec {
+        merge: cid("a"),
+        mainline_parent: cid("b"),
+        message: "m".into(),
+    });
+    let ExecutionPlan::Flatten(spec) = plan.remap_oids(&map).unwrap() else {
+        panic!("expected Flatten");
+    };
+    assert_eq!(spec.merge, cid("A"));
+    assert_eq!(spec.mainline_parent, cid("b"));
+}
+
+#[test]
+fn remap_dropped_target_errors() {
+    // A commit dropped by a prior rewrite can no longer be a target.
+    let map = omap(&[("a", None)]);
+    let plan = ExecutionPlan::Rebase(RebaseTodo {
+        base: None,
+        lines: vec![RebaseTodoLine::Reword(cid("a"))],
+        message_map: vec![],
+        author_map: vec![],
+    });
+    assert_eq!(
+        plan.remap_oids(&map),
+        Err(PlanError::CommitNotFound(cid("a")))
+    );
+}
+
+#[test]
+fn remap_empty_map_is_identity_clone() {
+    let plan = ExecutionPlan::Rebase(RebaseTodo {
+        base: Some(cid("x")),
+        lines: vec![RebaseTodoLine::Pick(cid("y"))],
+        message_map: vec![],
+        author_map: vec![],
+    });
+    assert_eq!(plan.remap_oids(&OidMap::new()).unwrap(), plan);
+}
+
+#[test]
+fn compose_chains_two_phases() {
+    // Phase 1: a→A, b→B (b later dropped), d dropped.
+    let first = omap(&[("a", Some("A")), ("b", Some("B")), ("d", None)]);
+    // Phase 2 (keyed by post-phase-1 ids): A→A2, B dropped, plus new id e→E.
+    let second = omap(&[("A", Some("A2")), ("B", None), ("e", Some("E"))]);
+
+    let composed = compose_oid_maps(&first, &second);
+    assert_eq!(composed.get(&cid("a")), Some(&Some(cid("A2"))));
+    assert_eq!(composed.get(&cid("b")), Some(&None)); // dropped in phase 2
+    assert_eq!(composed.get(&cid("d")), Some(&None)); // dropped in phase 1
+    // `e` was identity through phase 1, rewritten by phase 2.
+    assert_eq!(composed.get(&cid("e")), Some(&Some(cid("E"))));
+}
+
+#[test]
+fn compose_carries_unchanged_first_phase_ids() {
+    // `a` unchanged in phase 1 (absent), rewritten in phase 2.
+    let first = omap(&[("b", Some("B"))]);
+    let second = omap(&[("a", Some("A2"))]);
+    let composed = compose_oid_maps(&first, &second);
+    assert_eq!(composed.get(&cid("a")), Some(&Some(cid("A2"))));
+    // `b`→B in phase 1, B unchanged in phase 2 → stays B.
+    assert_eq!(composed.get(&cid("b")), Some(&Some(cid("B"))));
+}
