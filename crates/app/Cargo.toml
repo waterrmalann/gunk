@@ -11,3 +11,6 @@ eframe = { workspace = true }
 egui = { workspace = true }
 rfd = { workspace = true }
 time = { workspace = true }
+
+[dev-dependencies]
+egui_kittest = { workspace = true }

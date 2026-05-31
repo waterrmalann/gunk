@@ -1486,11 +1486,288 @@ fn format_relative_date(time: time::OffsetDateTime) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::commit_count_label;
+    use super::*;
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
+    use time::OffsetDateTime;
+
+    fn make_commit(oid: &str, summary: &str, is_merge: bool) -> Commit {
+        let now = OffsetDateTime::now_utc();
+        let identity = Identity {
+            name: "Alice".to_string(),
+            email: "alice@example.com".to_string(),
+            time: now,
+        };
+        Commit {
+            id: CommitId(oid.to_string()),
+            parents: if is_merge {
+                vec![
+                    CommitId("aaaaaaa0000000".into()),
+                    CommitId("bbbbbbb0000000".into()),
+                ]
+            } else {
+                vec![CommitId("aaaaaaa0000000".into())]
+            },
+            author: identity.clone(),
+            committer: identity,
+            summary: summary.to_string(),
+            body: String::new(),
+            changed_paths: vec![],
+        }
+    }
+
+    /// Build the expected label text for a commit row, matching
+    /// `render_commit_row`'s format string exactly.
+    fn expected_row_text(
+        moved: bool,
+        merge: bool,
+        badge: &str,
+        short_sha: &str,
+        summary: &str,
+        author: &str,
+    ) -> String {
+        let moved_m = if moved { "↕ " } else { "" };
+        let merge_m = if merge { "⑂ " } else { "" };
+        format!("{moved_m}{merge_m}{badge}{short_sha}  {summary:<60}  {author}  just now")
+    }
+
+    // ── Pure function tests ────────────────────────────────────────
 
     #[test]
     fn commit_count_label_indicates_when_history_is_partial() {
         assert_eq!(commit_count_label(500, true), "500+ commits loaded");
         assert_eq!(commit_count_label(500, false), "500 commits");
+    }
+
+    #[test]
+    fn format_relative_date_just_now() {
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(format_relative_date(now), "just now");
+    }
+
+    #[test]
+    fn format_relative_date_minutes() {
+        let t = OffsetDateTime::now_utc() - time::Duration::minutes(5);
+        assert_eq!(format_relative_date(t), "5 min ago");
+    }
+
+    #[test]
+    fn format_relative_date_hours() {
+        let t = OffsetDateTime::now_utc() - time::Duration::hours(3);
+        assert_eq!(format_relative_date(t), "3 hours ago");
+    }
+
+    #[test]
+    fn format_relative_date_days() {
+        let t = OffsetDateTime::now_utc() - time::Duration::days(15);
+        assert_eq!(format_relative_date(t), "15 days ago");
+    }
+
+    #[test]
+    fn format_relative_date_months() {
+        let t = OffsetDateTime::now_utc() - time::Duration::days(90);
+        assert_eq!(format_relative_date(t), "3 months ago");
+    }
+
+    #[test]
+    fn format_relative_date_years() {
+        let t = OffsetDateTime::now_utc() - time::Duration::days(400);
+        assert_eq!(format_relative_date(t), "1 years ago");
+    }
+
+    // ── egui_kittest rendering tests ───────────────────────────────
+
+    #[test]
+    fn commit_row_unchanged_renders_sha_and_summary() {
+        let commit = make_commit("abc1234567890abcdef", "Fix a critical bug", false);
+        let harness = Harness::new_ui(|ui| {
+            render_commit_row(ui, &commit, false, false, None);
+        });
+        let expected =
+            expected_row_text(false, false, "", "abc1234", "Fix a critical bug", "Alice");
+        harness.get_by_label(&expected);
+    }
+
+    #[test]
+    fn commit_row_merge_shows_marker() {
+        let commit = make_commit("def5678901234abcde", "Merge feature branch", true);
+        let harness = Harness::new_ui(|ui| {
+            render_commit_row(ui, &commit, false, false, None);
+        });
+        let expected = expected_row_text(
+            false,
+            true,
+            "",
+            "def5678",
+            "Merge feature branch",
+            "Alice",
+        );
+        harness.get_by_label(&expected);
+    }
+
+    #[test]
+    fn commit_row_dropped_shows_badge() {
+        let commit = make_commit("111222333444555aabb", "Remove old code", false);
+        let prow = PreviewRow {
+            id: commit.id.clone(),
+            summary: commit.summary.clone(),
+            status: RowStatus::Dropped,
+            moved: false,
+        };
+        let harness = Harness::new_ui(|ui| {
+            render_commit_row(ui, &commit, false, false, Some(&prow));
+        });
+        let expected = expected_row_text(
+            false,
+            false,
+            "[dropped] ",
+            "1112223",
+            "Remove old code",
+            "Alice",
+        );
+        harness.get_by_label(&expected);
+    }
+
+    #[test]
+    fn commit_row_reworded_shows_projected_summary() {
+        let commit = make_commit("aabbccddeeff001122", "Old summary", false);
+        let prow = PreviewRow {
+            id: commit.id.clone(),
+            summary: "Rewritten summary text".to_string(),
+            status: RowStatus::Reworded,
+            moved: false,
+        };
+        let harness = Harness::new_ui(|ui| {
+            render_commit_row(ui, &commit, false, false, Some(&prow));
+        });
+        let expected = expected_row_text(
+            false,
+            false,
+            "[reworded] ",
+            "aabbccd",
+            "Rewritten summary text",
+            "Alice",
+        );
+        harness.get_by_label(&expected);
+    }
+
+    #[test]
+    fn commit_row_squash_keep_shows_badge() {
+        let commit = make_commit("ffee001122334455aa", "Keep this commit", false);
+        let prow = PreviewRow {
+            id: commit.id.clone(),
+            summary: commit.summary.clone(),
+            status: RowStatus::SquashKeep,
+            moved: false,
+        };
+        let harness = Harness::new_ui(|ui| {
+            render_commit_row(ui, &commit, false, false, Some(&prow));
+        });
+        let expected = expected_row_text(
+            false,
+            false,
+            "[squash←] ",
+            "ffee001",
+            "Keep this commit",
+            "Alice",
+        );
+        harness.get_by_label(&expected);
+    }
+
+    #[test]
+    fn commit_row_moved_shows_arrow() {
+        let commit = make_commit("9988776655443322ab", "Moved commit", false);
+        let prow = PreviewRow {
+            id: commit.id.clone(),
+            summary: commit.summary.clone(),
+            status: RowStatus::Unchanged,
+            moved: true,
+        };
+        let harness = Harness::new_ui(|ui| {
+            render_commit_row(ui, &commit, false, false, Some(&prow));
+        });
+        let expected = expected_row_text(
+            true,
+            false,
+            "",
+            "9988776",
+            "Moved commit",
+            "Alice",
+        );
+        harness.get_by_label(&expected);
+    }
+
+    #[test]
+    fn commit_row_flattened_merge_shows_both_markers() {
+        let commit = make_commit("aabb11223344556677", "Merge develop", true);
+        let prow = PreviewRow {
+            id: commit.id.clone(),
+            summary: commit.summary.clone(),
+            status: RowStatus::Flattened,
+            moved: false,
+        };
+        let harness = Harness::new_ui(|ui| {
+            render_commit_row(ui, &commit, false, false, Some(&prow));
+        });
+        let expected = expected_row_text(
+            false,
+            true,
+            "[flattened] ",
+            "aabb112",
+            "Merge develop",
+            "Alice",
+        );
+        harness.get_by_label(&expected);
+    }
+
+    #[test]
+    fn detail_pane_shows_commit_metadata() {
+        let commit = make_commit("deadbeef12345678ab", "Add new feature", false);
+        let detail = CommitDetail {
+            changed_paths: vec![PathChange {
+                path: "src/main.rs".to_string(),
+                status: ChangeStatus::Modified,
+            }],
+            diff: "+added line\n-removed line".to_string(),
+        };
+        let harness = Harness::new_ui(|ui| {
+            render_detail(ui, &commit, &detail);
+        });
+        // The heading should contain the commit summary.
+        harness.get_by_label("Add new feature");
+        // The metadata grid should contain the author.
+        harness.get_by_label("Alice <alice@example.com>");
+        // SHA should be displayed.
+        harness.get_by_label("deadbeef12345678ab");
+        // Changed file should appear.
+        harness.get_by_label("src/main.rs");
+    }
+
+    #[test]
+    fn detail_pane_shows_body_when_present() {
+        let mut commit = make_commit("cafe0123456789abcd", "Summary line", false);
+        commit.body = "Extended description\nwith multiple lines.".to_string();
+        let detail = CommitDetail {
+            changed_paths: vec![],
+            diff: String::new(),
+        };
+        let harness = Harness::new_ui(|ui| {
+            render_detail(ui, &commit, &detail);
+        });
+        harness.get_by_label("Extended description\nwith multiple lines.");
+    }
+
+    #[test]
+    fn detail_pane_shows_parents_for_merge() {
+        let commit = make_commit("merge123456789abcd", "Merge PR #42", true);
+        let detail = CommitDetail {
+            changed_paths: vec![],
+            diff: String::new(),
+        };
+        let harness = Harness::new_ui(|ui| {
+            render_detail(ui, &commit, &detail);
+        });
+        // Parents label should show short hashes.
+        harness.get_by_label("aaaaaaa, bbbbbbb");
     }
 }

@@ -25,3 +25,4 @@ insta = { version = "1", features = ["yaml"] }
 proptest = "1"
 assert_cmd = "2"
 predicates = "3"
+egui_kittest = "0.31"
