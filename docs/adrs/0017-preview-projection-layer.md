@@ -13,14 +13,14 @@ Two questions arose. First, where does the draft reducer live — in `app` (per 
 
 ### Draft reducer in core
 
-`DraftState`/`DraftMsg` and their `reduce` live in `core::draft`, not `app`. ADR-0009 allows "`app` (or testable module)"; core is the testable module. This keeps the reducer free of any egui dependency and unit-tested alongside the rest of the domain. The reducer encodes upsert/replace/toggle semantics (reword upserts by target, set-message/set-author replace by exact target set, squash/fixup replace by keep, drop toggles, reorder replaces). `app` holds the `DraftState` and dispatches `DraftMsg`s collected from the render loop.
+`DraftState`/`DraftMsg` and their `reduce` live in `core::draft`, not `app`. ADR-0009 allows "`app` (or testable module)"; core is the testable module. This keeps the reducer free of any egui dependency and unit-tested alongside the rest of the domain. The reducer encodes upsert/replace/toggle/merge semantics: reword upserts by target; set-message/set-author/set-co-authors replace by exact target set; squash/fixup replace by keep; drop toggles, and drop-many adds idempotently in bulk; reorder replaces; toggle-flatten adds/removes flatten intent; remove-paths merges into any existing remove-paths op (unioning paths, OR-ing the gitignore flag); and remove-op deletes a draft entry by index. `app` holds the `DraftState` and dispatches `DraftMsg`s collected from the render loop.
 
 ### Preview projection as a separate function
 
 `core::preview::preview(snapshot, operations) -> Result<Vec<PreviewRow>, PlanError>` is a distinct projection layer, not part of the plan engine:
 
 1. It **validates through the real engine first** — if there are operations, it calls `plan(snapshot, operations)?`, so an invalid draft surfaces the exact same `PlanError` the engine would produce. There is one source of truth for validity.
-2. On success it projects one `PreviewRow` per commit in **display order** (reorder-aware, newest-first), each tagged with a `RowStatus` (Unchanged, Reworded, Reauthored, RewordedAndReauthored, SquashKeep, Absorbed, Flattened, Dropped), the projected summary, and a `moved` flag.
+2. On success it projects one `PreviewRow` per commit in **display order** (reorder-aware, newest-first), each tagged with a `RowStatus` (Unchanged, Reworded, Reauthored, RewordedAndReauthored, SquashKeep, Absorbed, Flattened, Dropped), the projected summary, and a `moved` flag. Co-author edits (`SetCoAuthors`) modify the commit body and therefore surface as `Reworded`; there is no distinct co-author status. (Movement is carried by the `moved` flag, not a `RowStatus` variant.)
 
 The app renders the list in projected order by iterating `preview_rows` when a draft exists (mapping each row back to its original index for selection/search), falling back to original order otherwise.
 

@@ -24,5 +24,5 @@ The `Commit` struct retains the `changed_paths: Vec<PathChange>` field for downs
 - **Fast branch switching** — loading a branch with 5,000 commits runs one `git log` call, not 5,001.
 - **Responsive UI** — the commit list renders immediately; detail loads only on selection.
 - **Simple API** — `changed_paths()` and `show_diff()` are independent, stateless calls. No caching layer needed in v1.
-- **Trade-off:** selecting a commit incurs two git calls. For typical repos this is <50ms — imperceptible. If it becomes a bottleneck on large repos, a simple LRU cache in the app layer can be added later.
+- **Trade-off:** selecting a commit incurs two git calls. For typical repos this is <50ms, but `git show -p` can be slow for very large ("fat") commits, so the app now runs `changed_paths()` + `show_diff()` on a background thread with request-ID staleness handling rather than on the UI thread (see ADR-0022's background-loading approach). The calls remain uncached — there is still no LRU; a simple app-layer cache can be added later if needed.
 - **Trade-off:** `Commit.changed_paths` is empty after `walk_commits`. Callers must not assume it is populated. This is documented in the method's contract.

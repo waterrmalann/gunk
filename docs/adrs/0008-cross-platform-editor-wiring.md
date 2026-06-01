@@ -1,7 +1,20 @@
 # ADR-0008: Cross-platform editor wiring via self-subcommands
 
-**Status:** Accepted  
+**Status:** Superseded — by ADR-0018 (todo wiring) and ADR-0019 (message feeding)  
 **Date:** 2026-05-31
+
+> **Superseded.** The `gunk --write-todo` / `gunk --write-msg` subcommands described
+> below were never implemented. The cross-platform problem this ADR identified is real,
+> but it was solved differently:
+> - **Todo list (`GIT_SEQUENCE_EDITOR`):** instead of a binary subcommand, the execution
+>   engine writes a generated POSIX shell script (`.gunk-seq-editor.sh`) that copies our
+>   todo onto git's target. See ADR-0018 ("Cross-Platform Editor Wiring").
+> - **Commit messages (`GIT_EDITOR`):** `GIT_EDITOR` is set to `true` (a no-op); prepared
+>   messages are fed via `exec git commit --amend -F` lines injected into the rebase todo,
+>   not through an editor at all. See ADR-0019, which supersedes the `GIT_EDITOR` portion
+>   of this ADR.
+>
+> The rest of this document is retained for historical context.
 
 ## Context
 

@@ -24,7 +24,7 @@ Use in-memory linear scan (`core::search::search_commits`).
 
 - **Simplicity** — ~60 lines of code, no data structures to maintain.
 - **Sufficient performance** — a branch walk typically returns hundreds to low thousands of commits. Linear scan over that is sub-millisecond.
-- **Pure and testable** — lives in `core` with no IO. 17 tests cover matching, multi-field hits, edge cases.
+- **Pure and testable** — lives in `core` with no IO. 16 tests cover matching, multi-field hits, edge cases.
 - **git log --grep** was rejected because it would require a round-trip to the git process on every keystroke and couldn't search changed paths without additional commands.
 
 ## Consequences

@@ -20,7 +20,7 @@ Place `SelectionState` and `SelectionMsg` in `core::selection` as a pure, determ
 
 ## Consequences
 
-- **22 unit tests** cover all selection behaviors without any GUI dependency.
+- **23 unit tests** cover all selection behaviors without any GUI dependency.
 - Selection semantics are reusable if the UI framework changes.
 - `SelectSet` bridges search results directly into selection, enabling "Select all results" with no glue logic.
 - `app` only does `ui.input(|inp| inp.modifiers)` → `SelectionMsg` mapping — trivially correct.

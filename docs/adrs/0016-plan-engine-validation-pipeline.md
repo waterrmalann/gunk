@@ -14,8 +14,8 @@ The plan engine (`core::plan`) compiles user `Operation`s into an `ExecutionPlan
 The plan engine runs a three-stage validation pipeline before building any plan:
 
 1. **Commit existence** — Every `CommitId` referenced by any operation must exist in the snapshot. Fail-fast with `PlanError::CommitNotFound`.
-2. **Structural invariants** — Per-operation checks: flatten targets must be 2-parent merges (not octopus), squash/fixup must have non-empty absorb lists, absorb must not contain the keep commit.
-3. **Cross-operation conflict detection** — Detects contradictions across the full operation set: drop+reword, drop+set-author, reword+set-message on the same commit, a commit appearing as both keep and absorbed, operations on absorbed commits (reword/set-author/set-message), duplicate keeps, multiple reorders.
+2. **Structural invariants** — Per-operation checks: flatten targets must be 2-parent merges (not octopus), squash/fixup must have non-empty absorb lists, absorb must not contain the keep commit, remove-paths must have a non-empty path set (`PlanError::EmptyPathRemoval` — an empty set would rewrite every commit id for no benefit).
+3. **Cross-operation conflict detection** — Detects contradictions across the full operation set: drop+reword, drop+set-author, drop+set-co-authors, reword+set-message on the same commit, a commit appearing as both keep and absorbed, operations on absorbed commits (reword/set-author/set-message/set-co-authors), duplicate keeps, multiple reorders.
 
 Each failure is a typed `PlanError` variant (not a generic string) so callers can handle errors programmatically.
 

@@ -13,10 +13,10 @@ Phase 6 adds the ability to remove files from repository history. This is implem
 - Feature is gated in the UI: if not installed, file removal checkboxes are hidden and an informational message is shown.
 - This follows the plan's requirement to "disable the feature with a clear, actionable message rather than failing at apply time."
 
-### 2. Scoped filter-repo via `--refs`
-- `git filter-repo` is invoked with `--refs refs/heads/<branch>` to scope it to the target branch only.
-- This puts filter-repo in "partial" mode, which **skips garbage collection** and **leaves other refs untouched**.
-- This is critical because our backup refs at `refs/gunk/backup/<branch>/<timestamp>` must survive the rewrite — they point at the pre-rewrite commit objects, which must remain in the object database for restore.
+### 2. Branch scoping via single-branch clone (not `--refs`)
+- Branch scoping is achieved by the rehearsal clone (decision 3), not by `git filter-repo --refs`. The clone is made with `--single-branch --branch <branch>`, so it contains only the target branch; `git filter-repo` is then invoked with just `--invert-paths --force` plus the `--path`/`--path-glob` entries, with no `--refs` argument.
+- Running filter-repo inside an isolated clone means the real repo's object store and refs are never touched during the rewrite. Our backup refs at `refs/gunk/backup/<branch>/<unix-millis>` live in the real repo and are therefore unaffected — only the rewritten tip is fetched back on success (decision 3).
+- Empty path sets are rejected upstream by the plan engine (`PlanError::EmptyPathRemoval`) so filter-repo is never invoked with no `--path` args (which would rewrite every commit id for no benefit).
 
 ### 3. Clone-based rehearsal for filter-repo
 - Unlike `execute_rebase` (which uses a throwaway worktree), `execute_filter_repo` rehearses in an **isolated `--no-hardlinks --single-branch` clone** of the repository.
@@ -40,6 +40,6 @@ Phase 6 adds the ability to remove files from repository history. This is implem
 
 ## Consequences
 - File removal from history requires `git-filter-repo` (Python) to be installed.
-- The `--refs` scoping means only the target branch is rewritten; other branches retain the removed files.
-- Backup refs survive filter-repo and can be used for restore.
+- The single-branch clone means only the target branch is rewritten; other branches retain the removed files.
+- Backup refs survive filter-repo (they live in the untouched real repo) and can be used for restore.
 - Mixed operations (file removal + rebase) work correctly via the OID remap pipeline (ADR-0024).

@@ -29,7 +29,8 @@ associative and handles dropped commits correctly.
 ### Plan retargeting
 `ExecutionPlan::remap_oids(&self, map: &OidMap)` produces a new `ExecutionPlan`
 whose operation targets are translated through the map. If a required target was
-dropped, it returns `PlanError::RemappedTargetDropped`.
+dropped (mapped to `None`), it returns `PlanError::CommitNotFound` — the later
+phase fails loudly and the composite rolls back rather than touching the wrong commit.
 
 ### Execution engine threading
 `execute_composite` in `gitio::execute`:
@@ -40,8 +41,15 @@ dropped, it returns `PlanError::RemappedTargetDropped`.
 5. On failure: restores from the single backup ref.
 
 Each phase populates its `ExecuteResult.oid_map`:
-- **Flatten**: maps the old merge OID to the new linearised OID, plus all
-  descendant mappings via `rev-list`.
+- **Flatten**: maps the old merge OID to the new linearised OID, plus each
+  descendant mapping derived by pairing the old and new `rev-list` ranges by
+  position. This pairing is only safe when the ranges line up one-to-one; if the
+  descendants contain another merge (rebase reorders/drops it) or the ranges
+  otherwise differ in length, pairing by position would silently map operations
+  onto the wrong commits. In that case every descendant is recorded as dropped
+  (`None`) instead. A plain flatten never reads this map, so it still works; a
+  composite phase that needs one of those commits gets a clean `CommitNotFound`
+  and rolls back.
 - **Filter-repo**: parses `.git/filter-repo/commit-map`.
 - **Rebase**: returns an empty map (always the last phase by plan-engine ordering).
 
@@ -53,6 +61,6 @@ with correct OID retargeting internally.
 ## Consequences
 - Composite plans are safe across arbitrary phase combinations.
 - The UI layer contains no execution-order or OID-translation logic.
-- A `RemappedTargetDropped` error surfaces clearly when a phase drops a commit that
+- A `CommitNotFound` error surfaces clearly when a phase drops a commit that
   a later phase needs.
 - The single-backup-ref design means rollback is always atomic.

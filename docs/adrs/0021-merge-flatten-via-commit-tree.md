@@ -36,8 +36,11 @@ The same safety protocol as all other mutations applies:
 
 ### Composition with other operations
 The plan engine orders flatten **before** filter-repo and rebase. Flatten
-rewrites OIDs, so the app's execution pipeline re-snapshots commits after
-flatten before proceeding to subsequent phases (filter-repo → rebase).
+rewrites OIDs, so subsequent phases must be retargeted onto the post-flatten
+history. This is now handled entirely inside `gitio::execute_composite` by
+threading an accumulated `OidMap` through the phases — the app no longer
+re-snapshots or re-plans between phases. See ADR-0024 for the OID-remap
+mechanism (which supersedes the earlier app-side re-snapshot approach).
 
 ### Scope limitations (v1)
 - **Octopus merges** (3+ parents) are rejected with `PlanError::OctopusMergeUnsupported`.

@@ -15,9 +15,9 @@ Every mutating apply follows a strict safety protocol, implemented in `gitio` an
 
 1. **Refuse on dirty tree.** Check `git status --porcelain=v2 -z`. If dirty, refuse and offer to auto-stash (`git stash push -u`) with explicit user consent. Restore on completion/abort.
 
-2. **Backup ref.** Before any rewrite, create `refs/cleanup/backup/<branch>/<unix-ts>` pointing at the current branch tip. The UI exposes "Restore from backup" which is just `update-ref` back. The reflog is the secondary safety net.
+2. **Backup ref.** Before any rewrite, create `refs/gunk/backup/<branch>/<unix-millis>` pointing at the current branch tip. The suffix uses millisecond resolution and `create_backup_ref` runs a bounded uniqueness search, so two rewrites of the same branch within the same instant never collapse to one ref name and silently destroy an earlier recovery point. The UI exposes "Restore from backup" which is just `update-ref` back. The reflog is the secondary safety net.
 
-3. **Rehearse in a throwaway worktree.** `git worktree add --detach <tmpdir> <branch-tip>`. Run the full plan there first. If it conflicts or fails, surface the error and **do not touch the real branch**. If it succeeds, fast-forward the real branch ref to the rehearsed result.
+3. **Rehearse in a throwaway worktree.** `git worktree add --detach <tmpdir> <branch-tip>`. Run the full plan there first. If it conflicts or fails, surface the error and **do not touch the real branch**. If it succeeds, force-update the real branch ref to the rehearsed result (a rewrite produces a tip that is not a descendant of the old one, so this is an overwrite, not a fast-forward).
 
 4. **Atomic ref update.** The real branch ref is only moved once the rehearsal proves the plan applies cleanly.
 

@@ -5,7 +5,7 @@
 
 ## Context
 
-Users accumulate edits in draft mode (reword, squash, reorder, drop, flatten, remove files, set author). These edits could be executed immediately as git commands, or captured as data and compiled into a plan.
+Users accumulate edits in draft mode (reword, squash, reorder, drop, flatten, remove files, set author, set co-authors). These edits could be executed immediately as git commands, or captured as data and compiled into a plan.
 
 Imperative execution makes it impossible to:
 - Preview the result before applying.
@@ -28,6 +28,7 @@ enum Operation {
     Reorder { new_order },
     RemovePaths { paths, add_to_gitignore },
     FlattenMerge { merge },
+    SetCoAuthors { targets, co_authors },
 }
 
 enum ExecutionPlan {

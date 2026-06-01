@@ -13,7 +13,7 @@ The execution engine lives in `gitio::execute` as a set of public functions (not
 
 - **`check_clean(git)`** — Refuses if working tree/index is dirty (`status --porcelain=v2 -z`).
 - **`stash_push(git)` / `stash_pop(git)`** — Opt-in auto-stash with detection of whether anything was actually stashed.
-- **`create_backup_ref(git, branch)`** — Creates `refs/gunk/backup/<branch>/<unix-ts>` pointing at the current tip.
+- **`create_backup_ref(git, branch)`** — Creates `refs/gunk/backup/<branch>/<unix-millis>` pointing at the current tip, using a bounded uniqueness search so back-to-back rewrites never overwrite an earlier backup.
 - **`list_backup_refs(git, branch)`** — Lists existing backups for restore UI.
 - **`restore_backup(git, branch, ref)`** — Resets branch to a backup ref, with working tree reset if currently checked out.
 - **`execute_rebase(git, branch, todo)`** — Orchestrates the full safety protocol for rebase-class plans.
@@ -21,7 +21,7 @@ The execution engine lives in `gitio::execute` as a set of public functions (not
 
 ### Safety Protocol (implemented)
 1. **Dirty tree refusal** — `check_clean` is the first call in `execute_rebase`. If dirty, returns `ExecuteError::DirtyTree` immediately.
-2. **Backup ref** — Created before any mutation. Format: `refs/gunk/backup/<branch>/<unix-ts>`. The backup ref survives indefinitely (not cleaned by `gc`).
+2. **Backup ref** — Created before any mutation. Format: `refs/gunk/backup/<branch>/<unix-millis>` (millisecond resolution + a uniqueness search so rapid successive rewrites of one branch each get a distinct, non-overwriting ref). The backup ref survives indefinitely (not cleaned by `gc`).
 3. **Worktree rehearsal** — A detached worktree (`.gunk-rehearsal`) is created at the branch tip. The rebase runs there first. On conflict, the real branch is never touched.
 4. **Apply on success** — Only after clean rehearsal does the real branch ref get updated via `update-ref`.
 5. **RAII cleanup** — `WorktreeGuard::drop()` always removes the worktree, even on panic or early return.
