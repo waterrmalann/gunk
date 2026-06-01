@@ -53,6 +53,11 @@ impl RepoFixture {
         fixture.git(["config", "user.email", DEFAULT_AUTHOR_EMAIL]);
         // Ensure consistent line endings across platforms
         fixture.git(["config", "core.autocrlf", "false"]);
+        // Isolate from host config that would break unattended commits: a global
+        // `commit.gpgsign=true` (or tag/push signing) makes git block on a GPG
+        // passphrase prompt. Local config overrides global, so force it off.
+        fixture.git(["config", "commit.gpgsign", "false"]);
+        fixture.git(["config", "tag.gpgsign", "false"]);
 
         fixture
     }
