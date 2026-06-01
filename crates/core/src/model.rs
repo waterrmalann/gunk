@@ -101,10 +101,10 @@ fn co_author_value(line: &str) -> Option<&str> {
 pub fn parse_co_authors(body: &str) -> Vec<CoAuthor> {
     let mut result = Vec::new();
     for line in body.lines() {
-        if let Some(rest) = co_author_value(line) {
-            if let Some((name, email)) = parse_trailer_identity(rest) {
-                result.push(CoAuthor { name, email });
-            }
+        if let Some(rest) = co_author_value(line)
+            && let Some((name, email)) = parse_trailer_identity(rest)
+        {
+            result.push(CoAuthor { name, email });
         }
     }
     result
@@ -176,7 +176,8 @@ mod tests {
 
     #[test]
     fn parse_co_authors_multiple() {
-        let body = "Body text\n\nCo-authored-by: Alice <alice@x.com>\nCo-authored-by: Bob <bob@x.com>";
+        let body =
+            "Body text\n\nCo-authored-by: Alice <alice@x.com>\nCo-authored-by: Bob <bob@x.com>";
         let result = parse_co_authors(body);
         assert_eq!(
             result,
@@ -247,10 +248,7 @@ mod tests {
     #[test]
     fn set_co_authors_in_body_multiple() {
         let body = "Body text";
-        let result = set_co_authors_in_body(
-            body,
-            &[ca("Alice", "a@x.com"), ca("Bob", "b@x.com")],
-        );
+        let result = set_co_authors_in_body(body, &[ca("Alice", "a@x.com"), ca("Bob", "b@x.com")]);
         assert_eq!(
             result,
             "Body text\n\nCo-authored-by: Alice <a@x.com>\nCo-authored-by: Bob <b@x.com>"

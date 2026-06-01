@@ -1839,7 +1839,7 @@ fn flatten_merge_with_resolved_conflicts() {
     execute_flatten(&git, "main", &spec).unwrap();
 
     // The tree at the tip should match the original merge tree (conflict resolution preserved).
-    let new_tree = fixture.git(["rev-parse", &format!("HEAD^{{tree}}")]);
+    let new_tree = fixture.git(["rev-parse", "HEAD^{tree}"]);
     assert_eq!(
         merge_tree.trim(),
         new_tree.trim(),
