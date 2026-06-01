@@ -194,6 +194,8 @@ pub enum PlanError {
     SelfAbsorb(CommitId),
     #[error("multiple reorder operations are not allowed")]
     MultipleReorders,
+    #[error("remove-paths operation has no paths; refusing to rewrite history for nothing")]
+    EmptyPathRemoval,
     #[error("no operations to plan")]
     NoOperations,
 }

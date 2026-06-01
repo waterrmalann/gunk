@@ -417,6 +417,19 @@ fn remove_paths() {
 }
 
 #[test]
+fn remove_paths_with_empty_set_is_rejected() {
+    // An empty path set would rewrite every commit id for no benefit; the plan
+    // engine must refuse it rather than emit a pointless filter-repo phase.
+    let snap = linear_snapshot();
+    let ops = vec![Operation::RemovePaths {
+        paths: vec![],
+        add_to_gitignore: false,
+    }];
+    let err = plan(&snap, &ops).unwrap_err();
+    assert_eq!(err, PlanError::EmptyPathRemoval);
+}
+
+#[test]
 fn flatten_merge() {
     let snap = snapshot_with_merge();
     let ops = vec![Operation::FlattenMerge { merge: cid("M") }];

@@ -129,19 +129,39 @@ pub fn stash_pop(git: &Git) -> Result<(), ExecuteError> {
 
 /// Create a backup ref for the current branch tip.
 ///
-/// Format: `refs/gunk/backup/<branch>/<unix-timestamp>`
+/// Format: `refs/gunk/backup/<branch>/<unix-millis>`
+///
+/// A backup is the only recovery point for a rewrite, so it must never silently
+/// overwrite an existing one. Millisecond resolution makes same-instant
+/// collisions rare; the loop guarantees a unique name even when two rewrites of
+/// the same branch land in the same millisecond, so no recovery point is lost.
 pub fn create_backup_ref(git: &Git, branch: &str) -> Result<String, ExecuteError> {
     let tip = git.run(["rev-parse", branch])?.stdout.trim().to_string();
 
-    let ts = SystemTime::now()
+    let mut suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_millis();
 
-    let ref_name = format!("refs/gunk/backup/{branch}/{ts}");
-    git.run(["update-ref", &ref_name, &tip])?;
+    // Bounded search for an unused ref name. The bound is a safety valve: in
+    // practice the first candidate is almost always free.
+    for _ in 0..1_000_000 {
+        let ref_name = format!("refs/gunk/backup/{branch}/{suffix}");
+        // `rev-parse --verify --quiet` exits non-zero (→ Err) when the ref does
+        // not exist, which is exactly the name we want to claim.
+        let exists = git
+            .run(["rev-parse", "--verify", "--quiet", &ref_name])
+            .is_ok();
+        if !exists {
+            git.run(["update-ref", &ref_name, &tip])?;
+            return Ok(ref_name);
+        }
+        suffix += 1;
+    }
 
-    Ok(ref_name)
+    Err(ExecuteError::BackupFailed(format!(
+        "could not find an unused backup ref name under refs/gunk/backup/{branch}/"
+    )))
 }
 
 /// List backup refs for a branch, newest first.
@@ -165,12 +185,16 @@ pub fn list_backup_refs(git: &Git, branch: &str) -> Result<Vec<(String, String)>
         }
     }
 
-    // Sort by timestamp suffix descending (newest first).
-    refs.sort_by(|a, b| {
-        let ts_a = a.0.strip_prefix(&prefix).unwrap_or("0");
-        let ts_b = b.0.strip_prefix(&prefix).unwrap_or("0");
-        ts_b.cmp(ts_a)
-    });
+    // Sort by timestamp suffix descending (newest first). Parse the suffix as a
+    // number so ordering stays correct across suffix widths (e.g. legacy
+    // second-resolution refs alongside millisecond ones); a lexicographic
+    // compare would rank a 10-digit value above a 13-digit one.
+    let parse_suffix = |full: &str| {
+        full.strip_prefix(&prefix)
+            .and_then(|s| s.parse::<u128>().ok())
+            .unwrap_or(0)
+    };
+    refs.sort_by(|a, b| parse_suffix(&b.0).cmp(&parse_suffix(&a.0)));
 
     Ok(refs)
 }

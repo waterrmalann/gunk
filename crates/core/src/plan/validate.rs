@@ -59,6 +59,15 @@ pub(super) fn validate_operations(
                     return Err(PlanError::EmptyAbsorb(keep.clone()));
                 }
             }
+            Operation::RemovePaths { paths, .. } => {
+                // An empty path set sends `filter-repo --invert-paths` with no
+                // `--path` args. That happens to be a no-op today, but it still
+                // rewrites every commit id for no benefit and leans on an
+                // external tool's defensive default. Refuse it at the boundary.
+                if paths.is_empty() {
+                    return Err(PlanError::EmptyPathRemoval);
+                }
+            }
             _ => {}
         }
     }

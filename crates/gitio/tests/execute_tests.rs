@@ -129,6 +129,37 @@ fn list_backup_refs_returns_refs_for_branch() {
 }
 
 #[test]
+fn rapid_backup_refs_never_collide() {
+    // The backup ref is the only recovery point for a rewrite. Several rewrites
+    // of the same branch in quick succession (well within one wall-clock second)
+    // must each get a distinct ref — otherwise a later backup silently
+    // overwrites an earlier recovery point. This regression guards that.
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "init", &[("f.txt", "hello")]);
+
+    let git = Git::open(fixture.path()).unwrap();
+
+    let mut names = std::collections::HashSet::new();
+    for _ in 0..6 {
+        let name = create_backup_ref(&git, "main").unwrap();
+        names.insert(name);
+    }
+    assert_eq!(
+        names.len(),
+        6,
+        "each rapid backup must get a unique ref name, got: {names:?}"
+    );
+
+    // Every backup must still be listed and point at the (unchanged) tip.
+    let tip = fixture.rev_parse("main");
+    let refs = list_backup_refs(&git, "main").unwrap();
+    assert_eq!(refs.len(), 6, "all six backups should be discoverable");
+    for (_, oid) in &refs {
+        assert_eq!(oid, &tip);
+    }
+}
+
+#[test]
 fn restore_backup_resets_branch_to_backup() {
     let mut fixture = RepoFixture::new();
     fixture.commit("c1", "first", &[("f.txt", "one")]);
