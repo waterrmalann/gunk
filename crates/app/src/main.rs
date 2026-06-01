@@ -873,10 +873,7 @@ impl eframe::App for App {
                         {
                             select_all_results = true;
                         }
-                        if ui
-                            .button(format!("{} Clear", icon::X))
-                            .clicked()
-                        {
+                        if ui.button(format!("{} Clear", icon::X)).clicked() {
                             repo.search_query.clear();
                             search_changed = true;
                         }
