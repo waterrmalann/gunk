@@ -893,12 +893,10 @@ fn set_co_authors_produces_reword_with_trailers() {
     snap[2].body = "Original body".to_string();
     let ops = vec![Operation::SetCoAuthors {
         targets: vec![cid("C")],
-        co_authors: vec![
-            crate::model::CoAuthor {
-                name: "Alice".into(),
-                email: "alice@x.com".into(),
-            },
-        ],
+        co_authors: vec![crate::model::CoAuthor {
+            name: "Alice".into(),
+            email: "alice@x.com".into(),
+        }],
     }];
     let result = plan(&snap, &ops).unwrap();
     if let ExecutionPlan::Rebase(todo) = result {
@@ -919,16 +917,18 @@ fn set_co_authors_removes_existing_trailers() {
     snap[2].body = "Body text\n\nCo-authored-by: Old <old@x.com>".to_string();
     let ops = vec![Operation::SetCoAuthors {
         targets: vec![cid("C")],
-        co_authors: vec![
-            crate::model::CoAuthor {
-                name: "New".into(),
-                email: "new@x.com".into(),
-            },
-        ],
+        co_authors: vec![crate::model::CoAuthor {
+            name: "New".into(),
+            email: "new@x.com".into(),
+        }],
     }];
     let result = plan(&snap, &ops).unwrap();
     if let ExecutionPlan::Rebase(todo) = result {
-        let (_, content) = todo.message_map.iter().find(|(id, _)| *id == cid("C")).unwrap();
+        let (_, content) = todo
+            .message_map
+            .iter()
+            .find(|(id, _)| *id == cid("C"))
+            .unwrap();
         assert!(!content.contains("Old"));
         assert!(content.contains("Co-authored-by: New <new@x.com>"));
         assert!(content.contains("Body text"));
@@ -947,7 +947,11 @@ fn set_co_authors_empty_clears_trailers() {
     }];
     let result = plan(&snap, &ops).unwrap();
     if let ExecutionPlan::Rebase(todo) = result {
-        let (_, content) = todo.message_map.iter().find(|(id, _)| *id == cid("C")).unwrap();
+        let (_, content) = todo
+            .message_map
+            .iter()
+            .find(|(id, _)| *id == cid("C"))
+            .unwrap();
         assert!(!content.contains("Co-authored-by"));
         assert!(content.contains("Body"));
     } else {
@@ -966,17 +970,19 @@ fn set_co_authors_combined_with_reword() {
         },
         Operation::SetCoAuthors {
             targets: vec![cid("C")],
-            co_authors: vec![
-                crate::model::CoAuthor {
-                    name: "Alice".into(),
-                    email: "alice@x.com".into(),
-                },
-            ],
+            co_authors: vec![crate::model::CoAuthor {
+                name: "Alice".into(),
+                email: "alice@x.com".into(),
+            }],
         },
     ];
     let result = plan(&snap, &ops).unwrap();
     if let ExecutionPlan::Rebase(todo) = result {
-        let (_, content) = todo.message_map.iter().find(|(id, _)| *id == cid("C")).unwrap();
+        let (_, content) = todo
+            .message_map
+            .iter()
+            .find(|(id, _)| *id == cid("C"))
+            .unwrap();
         assert!(content.contains("New summary"));
         assert!(content.contains("New body"));
         assert!(content.contains("Co-authored-by: Alice <alice@x.com>"));
@@ -1004,12 +1010,10 @@ fn set_co_authors_bulk_targets() {
     let snap = linear_snapshot();
     let ops = vec![Operation::SetCoAuthors {
         targets: vec![cid("B"), cid("C"), cid("D")],
-        co_authors: vec![
-            crate::model::CoAuthor {
-                name: "Bob".into(),
-                email: "bob@x.com".into(),
-            },
-        ],
+        co_authors: vec![crate::model::CoAuthor {
+            name: "Bob".into(),
+            email: "bob@x.com".into(),
+        }],
     }];
     let result = plan(&snap, &ops).unwrap();
     if let ExecutionPlan::Rebase(todo) = result {
@@ -1025,10 +1029,7 @@ fn set_co_authors_bulk_targets() {
 // ── OID remap across rewrite phases ────────────────────────────
 
 fn omap(pairs: &[(&str, Option<&str>)]) -> OidMap {
-    pairs
-        .iter()
-        .map(|(k, v)| (cid(k), v.map(cid)))
-        .collect()
+    pairs.iter().map(|(k, v)| (cid(k), v.map(cid))).collect()
 }
 
 #[test]
@@ -1052,7 +1053,10 @@ fn remap_rebase_todo_retargets_all_ids() {
     assert_eq!(t.base, Some(cid("A")));
     assert_eq!(t.lines[0], RebaseTodoLine::Pick(cid("B")));
     assert_eq!(t.lines[1], RebaseTodoLine::Reword(cid("C")));
-    assert_eq!(t.lines[2], RebaseTodoLine::Exec("git commit --amend".into()));
+    assert_eq!(
+        t.lines[2],
+        RebaseTodoLine::Exec("git commit --amend".into())
+    );
     assert_eq!(t.message_map[0].0, cid("C"));
     assert_eq!(t.author_map[0].0, cid("B"));
 }
