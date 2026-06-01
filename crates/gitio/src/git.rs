@@ -232,6 +232,16 @@ impl Git {
         Ok(CommitPage { commits, has_more })
     }
 
+    /// Count the total number of commits reachable from a branch tip.
+    pub fn count_commits(&self, branch: &str) -> Result<usize, GitError> {
+        let output = self.run(["rev-list", "--count", branch])?;
+        output
+            .stdout
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| GitError::InvalidUtf8)
+    }
+
     /// Get the changed file paths for a single commit.
     ///
     /// For root commits (no parents), diffs against the empty tree.

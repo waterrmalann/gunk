@@ -39,7 +39,13 @@ struct RepoState {
     branches: Vec<BranchInfo>,
     selected_branch: usize,
     commits: Vec<Commit>,
+    /// Maps each commit's id to its index in `commits`. Cached so the
+    /// reorder-aware preview render does not rebuild it O(N) every frame;
+    /// rebuilt only when `commits` changes via `rebuild_commit_index`.
+    commit_index: HashMap<CommitId, usize>,
     has_more_commits: bool,
+    /// Total commits reachable from the branch tip (for the "loaded of total" label).
+    total_commits: usize,
     /// Commit selection (multi-select via Ctrl/Shift).
     selection: SelectionState,
     /// Lazily loaded detail for the focused commit (last clicked).
@@ -83,9 +89,33 @@ struct RepoState {
     add_to_gitignore: bool,
 }
 
+impl RepoState {
+    /// Rebuild the `commit_index` lookup. Call after any mutation of `commits`.
+    fn rebuild_commit_index(&mut self) {
+        self.commit_index = self
+            .commits
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.id.clone(), i))
+            .collect();
+    }
+}
+
 struct CommitDetail {
     changed_paths: Vec<PathChange>,
-    diff: String,
+    /// Diff split into lines once at load time so the diff pane can render
+    /// virtualized rows (`ScrollArea::show_rows`) without re-splitting per frame.
+    diff_lines: Vec<String>,
+}
+
+impl CommitDetail {
+    fn from_diff(changed_paths: Vec<PathChange>, diff: String) -> Self {
+        let diff_lines = diff.lines().map(str::to_string).collect();
+        Self {
+            changed_paths,
+            diff_lines,
+        }
+    }
 }
 
 enum PendingLoadKind {
@@ -103,6 +133,7 @@ struct ExecOutcome {
     exec_result: ExecuteResult,
     commits: Vec<Commit>,
     has_more: bool,
+    total_commits: usize,
 }
 
 struct ExecResponse {
@@ -115,11 +146,29 @@ struct PendingExec {
     message: String,
 }
 
+struct DetailOutcome {
+    /// Commit index the detail was loaded for, so a stale response for a
+    /// commit the user has since navigated away from can be discarded.
+    idx: usize,
+    changed_paths: Vec<PathChange>,
+    diff: String,
+}
+
+struct DetailResponse {
+    request_id: u64,
+    result: Result<DetailOutcome, String>,
+}
+
+struct PendingDetail {
+    request_id: u64,
+}
+
 struct RepoLoadSnapshot {
     git: Git,
     branches: Vec<BranchInfo>,
     commits: Vec<Commit>,
     has_more_commits: bool,
+    total_commits: usize,
     filter_repo_available: bool,
 }
 
@@ -129,6 +178,7 @@ enum LoadOutcome {
         new_idx: usize,
         commits: Vec<Commit>,
         has_more_commits: bool,
+        total_commits: usize,
     },
 }
 
@@ -146,6 +196,8 @@ struct App {
     pending_load: Option<PendingLoad>,
     exec_rx: Option<Receiver<ExecResponse>>,
     pending_exec: Option<PendingExec>,
+    detail_rx: Option<Receiver<DetailResponse>>,
+    pending_detail: Option<PendingDetail>,
     next_request_id: u64,
 }
 
@@ -153,16 +205,17 @@ fn read_commit_window(
     git: &Git,
     branch: &str,
     desired_count: usize,
-) -> Result<(Vec<Commit>, bool), gunk_gitio::GitError> {
+) -> Result<(Vec<Commit>, bool, usize), gunk_gitio::GitError> {
     let page = git.walk_commits_page(branch, 0, desired_count.max(COMMIT_PAGE_SIZE))?;
-    Ok((page.commits, page.has_more))
+    let total = git.count_commits(branch)?;
+    Ok((page.commits, page.has_more, total))
 }
 
-fn commit_count_label(loaded_count: usize, has_more: bool) -> String {
-    if has_more {
-        format!("{loaded_count}+ commits loaded")
-    } else {
+fn commit_count_label(loaded_count: usize, total: usize) -> String {
+    if loaded_count >= total {
         format!("{loaded_count} commits")
+    } else {
+        format!("{loaded_count} of {total} commits loaded")
     }
 }
 
@@ -193,7 +246,7 @@ impl App {
                     return Err("Repository has no branches.".to_string());
                 }
 
-                let (commits, has_more_commits) =
+                let (commits, has_more_commits, total_commits) =
                     read_commit_window(&git, &branches[0].name, COMMIT_PAGE_SIZE)
                         .map_err(|e| format!("Failed to read commits: {e}"))?;
 
@@ -203,6 +256,7 @@ impl App {
                     branches,
                     commits,
                     has_more_commits,
+                    total_commits,
                 }))
             })();
 
@@ -231,11 +285,14 @@ impl App {
 
         thread::spawn(move || {
             let result = read_commit_window(&git, &branch_name, COMMIT_PAGE_SIZE)
-                .map(|(commits, has_more_commits)| LoadOutcome::SwitchBranch {
-                    new_idx,
-                    commits,
-                    has_more_commits,
-                })
+                .map(
+                    |(commits, has_more_commits, total_commits)| LoadOutcome::SwitchBranch {
+                        new_idx,
+                        commits,
+                        has_more_commits,
+                        total_commits,
+                    },
+                )
                 .map_err(|e| format!("Failed to read commits: {e}"));
 
             let _ = tx.send(LoadResponse { request_id, result });
@@ -273,12 +330,14 @@ impl App {
             }
             (PendingLoadKind::OpenRepo, Ok(LoadOutcome::OpenRepo(snapshot))) => {
                 let selection = SelectionState::new(snapshot.commits.len());
-                self.repo = Some(RepoState {
+                let mut state = RepoState {
                     git: snapshot.git,
                     branches: snapshot.branches,
                     selected_branch: 0,
                     commits: snapshot.commits,
+                    commit_index: HashMap::new(),
                     has_more_commits: snapshot.has_more_commits,
+                    total_commits: snapshot.total_commits,
                     selection,
                     detail: None,
                     search_query: String::new(),
@@ -300,7 +359,9 @@ impl App {
                     filter_repo_available: snapshot.filter_repo_available,
                     files_selected_for_removal: std::collections::BTreeSet::new(),
                     add_to_gitignore: false,
-                });
+                };
+                state.rebuild_commit_index();
+                self.repo = Some(state);
             }
             (
                 PendingLoadKind::SwitchBranch {
@@ -310,6 +371,7 @@ impl App {
                     new_idx,
                     commits,
                     has_more_commits,
+                    total_commits,
                 }),
             ) => {
                 if expected_idx != new_idx {
@@ -321,7 +383,9 @@ impl App {
                     repo.selected_branch = new_idx;
                     repo.selection = SelectionState::new(commits.len());
                     repo.commits = commits;
+                    repo.rebuild_commit_index();
                     repo.has_more_commits = has_more_commits;
+                    repo.total_commits = total_commits;
                     repo.detail = None;
                     repo.search_query.clear();
                     repo.search_hits.clear();
@@ -372,7 +436,9 @@ impl App {
                     repo.execute_result = Some(Ok(outcome.exec_result));
                     repo.selection = SelectionState::new(outcome.commits.len());
                     repo.commits = outcome.commits;
+                    repo.rebuild_commit_index();
                     repo.has_more_commits = outcome.has_more;
+                    repo.total_commits = outcome.total_commits;
                     repo.draft = DraftState::new();
                     repo.preview_rows.clear();
                     repo.plan_error = None;
@@ -401,36 +467,99 @@ impl App {
         }
     }
 
+    /// Kick off loading the detail (changed paths + diff) for the focused
+    /// commit on a background thread. `git show -p` can be very slow for fat
+    /// commits, so it must never run on the UI thread. The latest request wins:
+    /// stale responses are discarded by `request_id` in `poll_background_detail`.
     fn load_detail_for_focus(&mut self) {
-        let mut load_error = None;
-        if let Some(repo) = &mut self.repo {
-            // Show detail for the single selected commit, or the last one if multiple.
-            let focus = if repo.selection.len() == 1 {
-                repo.selection.selected.iter().next().copied()
-            } else {
-                None
-            };
+        let Some(repo) = &self.repo else { return };
 
-            if let Some(idx) = focus {
-                let oid = repo.commits[idx].id.0.clone();
-                match (repo.git.changed_paths(&oid), repo.git.show_diff(&oid)) {
-                    (Ok(changed_paths), Ok(diff)) => {
-                        repo.detail = Some(CommitDetail {
-                            changed_paths,
-                            diff,
-                        });
-                    }
-                    (Err(e), _) | (_, Err(e)) => {
-                        repo.detail = None;
-                        load_error = Some(format!("Failed to load commit detail: {e}"));
-                    }
-                }
-            } else {
+        // Show detail for the single selected commit only.
+        let focus = if repo.selection.len() == 1 {
+            repo.selection.selected.iter().next().copied()
+        } else {
+            None
+        };
+
+        let Some(idx) = focus else {
+            // Multi-select or empty: clear detail and cancel any in-flight load.
+            if let Some(repo) = &mut self.repo {
                 repo.detail = None;
             }
+            self.pending_detail = None;
+            self.detail_rx = None;
+            return;
+        };
+
+        let oid = repo.commits[idx].id.0.clone();
+        let git = repo.git.clone();
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.saturating_add(1);
+
+        // Clear stale detail so the pane shows a loading state, not the
+        // previously-focused commit's diff.
+        if let Some(repo) = &mut self.repo {
+            repo.detail = None;
         }
-        if load_error.is_some() {
-            self.error = load_error;
+
+        let (tx, rx) = mpsc::channel();
+        self.detail_rx = Some(rx);
+        self.pending_detail = Some(PendingDetail { request_id });
+
+        thread::spawn(move || {
+            let result = (|| -> Result<DetailOutcome, String> {
+                let changed_paths = git.changed_paths(&oid).map_err(|e| format!("{e}"))?;
+                let diff = git.show_diff(&oid).map_err(|e| format!("{e}"))?;
+                Ok(DetailOutcome {
+                    idx,
+                    changed_paths,
+                    diff,
+                })
+            })();
+            let _ = tx.send(DetailResponse { request_id, result });
+        });
+    }
+
+    fn poll_background_detail(&mut self) {
+        let response = {
+            let Some(rx) = &self.detail_rx else { return };
+            match rx.try_recv() {
+                Ok(r) => Some(r),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => {
+                    self.detail_rx = None;
+                    self.pending_detail = None;
+                    None
+                }
+            }
+        };
+
+        let Some(response) = response else { return };
+        let Some(pending) = &self.pending_detail else {
+            return;
+        };
+        if pending.request_id != response.request_id {
+            // A newer request superseded this one; ignore the stale result.
+            return;
+        }
+        self.pending_detail = None;
+        self.detail_rx = None;
+
+        match response.result {
+            Ok(outcome) => {
+                if let Some(repo) = &mut self.repo {
+                    // Only apply if the focused commit is still the one we loaded.
+                    let still_focused = repo.selection.len() == 1
+                        && repo.selection.selected.iter().next().copied() == Some(outcome.idx);
+                    if still_focused {
+                        repo.detail =
+                            Some(CommitDetail::from_diff(outcome.changed_paths, outcome.diff));
+                    }
+                }
+            }
+            Err(err) => {
+                self.error = Some(format!("Failed to load commit detail: {err}"));
+            }
         }
     }
 
@@ -482,6 +611,7 @@ impl App {
             {
                 Ok(page) => {
                     repo.commits.extend(page.commits);
+                    repo.rebuild_commit_index();
                     repo.has_more_commits = page.has_more;
                     repo.selection.count = repo.commits.len();
                     refresh_search = !repo.search_query.is_empty();
@@ -552,14 +682,16 @@ impl App {
 
         thread::spawn(move || {
             let result = (|| -> Result<ExecOutcome, String> {
-                let exec_result = gitio_execute_plan(&git, &branch, &exec_plan)
-                    .map_err(|e| format!("{e}"))?;
-                let (commits, has_more) = read_commit_window(&git, &branch, loaded_count)
-                    .map_err(|e| format!("Failed to reload commits: {e}"))?;
+                let exec_result =
+                    gitio_execute_plan(&git, &branch, &exec_plan).map_err(|e| format!("{e}"))?;
+                let (commits, has_more, total_commits) =
+                    read_commit_window(&git, &branch, loaded_count)
+                        .map_err(|e| format!("Failed to reload commits: {e}"))?;
                 Ok(ExecOutcome {
                     exec_result,
                     commits,
                     has_more,
+                    total_commits,
                 })
             })();
             let _ = tx.send(ExecResponse { request_id, result });
@@ -591,15 +723,19 @@ impl App {
                 repo.detail = None;
                 repo.execute_result = None;
                 match read_commit_window(&repo.git, &branch, repo.commits.len()) {
-                    Ok((commits, has_more_commits)) => {
+                    Ok((commits, has_more_commits, total_commits)) => {
                         repo.selection = SelectionState::new(commits.len());
                         repo.commits = commits;
+                        repo.rebuild_commit_index();
                         repo.has_more_commits = has_more_commits;
+                        repo.total_commits = total_commits;
                     }
                     Err(e) => {
                         repo.selection = SelectionState::new(0);
                         repo.commits.clear();
+                        repo.rebuild_commit_index();
                         repo.has_more_commits = false;
+                        repo.total_commits = 0;
                         self.error = Some(format!("Failed to reload commits: {e}"));
                     }
                 }
@@ -615,7 +751,11 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_background_load();
         self.poll_background_exec();
-        if self.pending_load.is_some() || self.pending_exec.is_some() {
+        self.poll_background_detail();
+        if self.pending_load.is_some()
+            || self.pending_exec.is_some()
+            || self.pending_detail.is_some()
+        {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
 
@@ -625,6 +765,7 @@ impl eframe::App for App {
         let is_loading = self.pending_load.is_some();
         let is_executing = self.pending_exec.is_some();
         let is_busy = is_loading || is_executing;
+        let is_loading_detail = self.pending_detail.is_some();
 
         // Top bar
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
@@ -655,10 +796,7 @@ impl eframe::App for App {
                     }
 
                     ui.separator();
-                    ui.label(commit_count_label(
-                        repo.commits.len(),
-                        repo.has_more_commits,
-                    ));
+                    ui.label(commit_count_label(repo.commits.len(), repo.total_commits));
 
                     if repo.has_more_commits
                         && !is_busy
@@ -955,6 +1093,11 @@ impl eframe::App for App {
                                     "ℹ Install git-filter-repo to enable file removal from history.",
                                 );
                             }
+                        } else if is_loading_detail {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Loading commit detail…");
+                            });
                         }
                     } else if sel_len > 1 {
                         // Bulk actions over the selected set. The oldest commit
@@ -1237,52 +1380,49 @@ impl eframe::App for App {
                 let order: Vec<(usize, Option<&PreviewRow>)> = if repo.preview_rows.is_empty() {
                     (0..repo.commits.len()).map(|i| (i, None)).collect()
                 } else {
-                    // Original index of each commit, for the reorder-aware lookup.
-                    let index_by_id: HashMap<&CommitId, usize> = repo
-                        .commits
-                        .iter()
-                        .enumerate()
-                        .map(|(i, c)| (&c.id, i))
-                        .collect();
+                    // Reorder-aware lookup via the cached commit index (rebuilt
+                    // only when commits change, not every frame).
                     repo.preview_rows
                         .iter()
-                        .map(|r| (index_by_id[&r.id], Some(r)))
+                        .map(|r| (repo.commit_index[&r.id], Some(r)))
                         .collect()
                 };
 
+                // Card height: meta line (small) + message line (body) +
+                // inter-line spacing + the frame's vertical inner margin, plus
+                // a little gap between cards.
+                let card_height = ui.text_style_height(&egui::TextStyle::Small)
+                    + ui.text_style_height(&egui::TextStyle::Body)
+                    + 3.0  // item_spacing.y between the two lines
+                    + 12.0 // inner_margin top + bottom (6 + 6)
+                    + 4.0; // gap between cards
+
                 egui::ScrollArea::vertical()
                     .auto_shrink([false; 2])
-                    .show_rows(
-                        ui,
-                        ui.text_style_height(&egui::TextStyle::Monospace)
-                            .max(ui.spacing().interact_size.y)
-                            + 4.0,
-                        order.len(),
-                        |ui, row_range| {
-                            for row_index in row_range {
-                                let (i, prow) = order[row_index];
-                                let commit = &repo.commits[i];
-                                let selected = repo.selection.is_selected(i);
-                                let is_search_match =
-                                    searching && repo.search_match_indices.contains(&i);
+                    .show_rows(ui, card_height, order.len(), |ui, row_range| {
+                        for row_index in row_range {
+                            let (i, prow) = order[row_index];
+                            let commit = &repo.commits[i];
+                            let selected = repo.selection.is_selected(i);
+                            let is_search_match =
+                                searching && repo.search_match_indices.contains(&i);
 
-                                let response =
-                                    render_commit_row(ui, commit, selected, is_search_match, prow);
+                            let response =
+                                render_commit_row(ui, commit, selected, is_search_match, prow);
 
-                                if response.clicked() {
-                                    let modifiers = ui.input(|inp| inp.modifiers);
-                                    let msg = if modifiers.ctrl || modifiers.command {
-                                        SelectionMsg::CtrlClick(i)
-                                    } else if modifiers.shift {
-                                        SelectionMsg::ShiftClick(i)
-                                    } else {
-                                        SelectionMsg::Click(i)
-                                    };
-                                    selection_msg = Some(msg);
-                                }
+                            if response.clicked() {
+                                let modifiers = ui.input(|inp| inp.modifiers);
+                                let msg = if modifiers.ctrl || modifiers.command {
+                                    SelectionMsg::CtrlClick(i)
+                                } else if modifiers.shift {
+                                    SelectionMsg::ShiftClick(i)
+                                } else {
+                                    SelectionMsg::Click(i)
+                                };
+                                selection_msg = Some(msg);
                             }
-                        },
-                    );
+                        }
+                    });
             }
         });
 
@@ -1347,30 +1487,74 @@ fn render_commit_row(
         ""
     };
 
-    let text =
-        format!("{moved_marker}{merge_marker}{badge}{short_sha}  {summary:<60}  {author}  {date}");
+    // Meta line: markers, badge, short hash, author, and relative time as
+    // small, de-emphasised text.
+    let meta_text =
+        format!("{moved_marker}{merge_marker}{badge}{short_sha}  ·  {author}  ·  {date}");
 
-    let mut rich_text = egui::RichText::new(&text).monospace();
+    // Message line: the (projected) summary, rendered larger for readability.
+    // When the card is selected its background is a saturated highlight, so
+    // status tints are dropped in favour of high-contrast text.
+    let mut message = egui::RichText::new(summary);
     match status {
         RowStatus::Dropped | RowStatus::Absorbed => {
-            rich_text = rich_text.strikethrough().color(egui::Color32::GRAY);
+            message = message.strikethrough();
+            if !selected {
+                message = message.color(egui::Color32::GRAY);
+            }
         }
         RowStatus::Reworded
         | RowStatus::Reauthored
         | RowStatus::RewordedAndReauthored
         | RowStatus::SquashKeep
-        | RowStatus::Flattened => {
-            rich_text = rich_text.color(egui::Color32::from_rgb(100, 150, 255));
+        | RowStatus::Flattened
+            if !selected =>
+        {
+            message = message.color(egui::Color32::from_rgb(100, 150, 255));
         }
-        RowStatus::Unchanged => {}
+        _ => {}
     }
-    if is_search_match && !selected {
-        rich_text =
-            rich_text.background_color(egui::Color32::from_rgba_premultiplied(80, 80, 0, 40));
+    if selected {
+        message = message.color(egui::Color32::WHITE);
     }
 
-    let label = egui::SelectableLabel::new(selected, rich_text);
-    ui.add(label)
+    // Reuse last frame's response to know whether the card is hovered, so the
+    // background can highlight before the content is painted.
+    let id = ui.make_persistent_id(("commit-card", commit.id.0.as_str()));
+    let hovered = ui
+        .ctx()
+        .read_response(id)
+        .is_some_and(|r| r.hovered() || r.clicked());
+
+    let visuals = ui.visuals();
+    let fill = if selected {
+        visuals.selection.bg_fill
+    } else if hovered {
+        visuals.widgets.hovered.weak_bg_fill
+    } else if is_search_match {
+        egui::Color32::from_rgba_premultiplied(80, 80, 0, 40)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+
+    let inner = egui::Frame::default()
+        .fill(fill)
+        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 3.0;
+            let mut meta = egui::RichText::new(&meta_text).small().monospace();
+            meta = if selected {
+                meta.color(egui::Color32::from_rgb(220, 230, 245))
+            } else {
+                meta.weak()
+            };
+            ui.label(meta);
+            ui.label(message);
+        });
+
+    ui.interact(inner.response.rect, id, egui::Sense::click())
 }
 
 /// Render the detail pane for a selected commit.
@@ -1436,12 +1620,16 @@ fn render_detail(ui: &mut egui::Ui, commit: &Commit, detail: &CommitDetail) {
 
     ui.separator();
 
-    // Diff
+    // Diff — virtualized so a large diff (thousands of lines) only lays out
+    // the visible rows each frame instead of every line.
     ui.strong("Diff");
+    let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
     egui::ScrollArea::vertical()
         .id_salt("diff_view")
-        .show(ui, |ui| {
-            for line in detail.diff.lines() {
+        .auto_shrink([false; 2])
+        .show_rows(ui, row_height, detail.diff_lines.len(), |ui, row_range| {
+            for row in row_range {
+                let line = &detail.diff_lines[row];
                 let color = if line.starts_with('+') && !line.starts_with("+++") {
                     egui::Color32::from_rgb(80, 200, 80)
                 } else if line.starts_with('-') && !line.starts_with("---") {
@@ -1516,27 +1704,26 @@ mod tests {
         }
     }
 
-    /// Build the expected label text for a commit row, matching
-    /// `render_commit_row`'s format string exactly.
-    fn expected_row_text(
+    /// Build the expected meta-line text for a commit row, matching the
+    /// metadata format string in `render_commit_row` exactly.
+    fn expected_meta_text(
         moved: bool,
         merge: bool,
         badge: &str,
         short_sha: &str,
-        summary: &str,
         author: &str,
     ) -> String {
         let moved_m = if moved { "↕ " } else { "" };
         let merge_m = if merge { "⑂ " } else { "" };
-        format!("{moved_m}{merge_m}{badge}{short_sha}  {summary:<60}  {author}  just now")
+        format!("{moved_m}{merge_m}{badge}{short_sha}  ·  {author}  ·  just now")
     }
 
     // ── Pure function tests ────────────────────────────────────────
 
     #[test]
     fn commit_count_label_indicates_when_history_is_partial() {
-        assert_eq!(commit_count_label(500, true), "500+ commits loaded");
-        assert_eq!(commit_count_label(500, false), "500 commits");
+        assert_eq!(commit_count_label(500, 1200), "500 of 1200 commits loaded");
+        assert_eq!(commit_count_label(500, 500), "500 commits");
     }
 
     #[test]
@@ -1583,9 +1770,9 @@ mod tests {
         let harness = Harness::new_ui(|ui| {
             render_commit_row(ui, &commit, false, false, None);
         });
-        let expected =
-            expected_row_text(false, false, "", "abc1234", "Fix a critical bug", "Alice");
-        harness.get_by_label(&expected);
+        let expected_meta = expected_meta_text(false, false, "", "abc1234", "Alice");
+        harness.get_by_label(&expected_meta);
+        harness.get_by_label("Fix a critical bug");
     }
 
     #[test]
@@ -1594,15 +1781,9 @@ mod tests {
         let harness = Harness::new_ui(|ui| {
             render_commit_row(ui, &commit, false, false, None);
         });
-        let expected = expected_row_text(
-            false,
-            true,
-            "",
-            "def5678",
-            "Merge feature branch",
-            "Alice",
-        );
-        harness.get_by_label(&expected);
+        let expected_meta = expected_meta_text(false, true, "", "def5678", "Alice");
+        harness.get_by_label(&expected_meta);
+        harness.get_by_label("Merge feature branch");
     }
 
     #[test]
@@ -1617,15 +1798,9 @@ mod tests {
         let harness = Harness::new_ui(|ui| {
             render_commit_row(ui, &commit, false, false, Some(&prow));
         });
-        let expected = expected_row_text(
-            false,
-            false,
-            "[dropped] ",
-            "1112223",
-            "Remove old code",
-            "Alice",
-        );
-        harness.get_by_label(&expected);
+        let expected_meta = expected_meta_text(false, false, "[dropped] ", "1112223", "Alice");
+        harness.get_by_label(&expected_meta);
+        harness.get_by_label("Remove old code");
     }
 
     #[test]
@@ -1640,15 +1815,9 @@ mod tests {
         let harness = Harness::new_ui(|ui| {
             render_commit_row(ui, &commit, false, false, Some(&prow));
         });
-        let expected = expected_row_text(
-            false,
-            false,
-            "[reworded] ",
-            "aabbccd",
-            "Rewritten summary text",
-            "Alice",
-        );
-        harness.get_by_label(&expected);
+        let expected_meta = expected_meta_text(false, false, "[reworded] ", "aabbccd", "Alice");
+        harness.get_by_label(&expected_meta);
+        harness.get_by_label("Rewritten summary text");
     }
 
     #[test]
@@ -1663,15 +1832,9 @@ mod tests {
         let harness = Harness::new_ui(|ui| {
             render_commit_row(ui, &commit, false, false, Some(&prow));
         });
-        let expected = expected_row_text(
-            false,
-            false,
-            "[squash←] ",
-            "ffee001",
-            "Keep this commit",
-            "Alice",
-        );
-        harness.get_by_label(&expected);
+        let expected_meta = expected_meta_text(false, false, "[squash←] ", "ffee001", "Alice");
+        harness.get_by_label(&expected_meta);
+        harness.get_by_label("Keep this commit");
     }
 
     #[test]
@@ -1686,15 +1849,9 @@ mod tests {
         let harness = Harness::new_ui(|ui| {
             render_commit_row(ui, &commit, false, false, Some(&prow));
         });
-        let expected = expected_row_text(
-            true,
-            false,
-            "",
-            "9988776",
-            "Moved commit",
-            "Alice",
-        );
-        harness.get_by_label(&expected);
+        let expected_meta = expected_meta_text(true, false, "", "9988776", "Alice");
+        harness.get_by_label(&expected_meta);
+        harness.get_by_label("Moved commit");
     }
 
     #[test]
@@ -1709,27 +1866,21 @@ mod tests {
         let harness = Harness::new_ui(|ui| {
             render_commit_row(ui, &commit, false, false, Some(&prow));
         });
-        let expected = expected_row_text(
-            false,
-            true,
-            "[flattened] ",
-            "aabb112",
-            "Merge develop",
-            "Alice",
-        );
-        harness.get_by_label(&expected);
+        let expected_meta = expected_meta_text(false, true, "[flattened] ", "aabb112", "Alice");
+        harness.get_by_label(&expected_meta);
+        harness.get_by_label("Merge develop");
     }
 
     #[test]
     fn detail_pane_shows_commit_metadata() {
         let commit = make_commit("deadbeef12345678ab", "Add new feature", false);
-        let detail = CommitDetail {
-            changed_paths: vec![PathChange {
+        let detail = CommitDetail::from_diff(
+            vec![PathChange {
                 path: "src/main.rs".to_string(),
                 status: ChangeStatus::Modified,
             }],
-            diff: "+added line\n-removed line".to_string(),
-        };
+            "+added line\n-removed line".to_string(),
+        );
         let harness = Harness::new_ui(|ui| {
             render_detail(ui, &commit, &detail);
         });
@@ -1747,10 +1898,7 @@ mod tests {
     fn detail_pane_shows_body_when_present() {
         let mut commit = make_commit("cafe0123456789abcd", "Summary line", false);
         commit.body = "Extended description\nwith multiple lines.".to_string();
-        let detail = CommitDetail {
-            changed_paths: vec![],
-            diff: String::new(),
-        };
+        let detail = CommitDetail::from_diff(vec![], String::new());
         let harness = Harness::new_ui(|ui| {
             render_detail(ui, &commit, &detail);
         });
@@ -1760,10 +1908,7 @@ mod tests {
     #[test]
     fn detail_pane_shows_parents_for_merge() {
         let commit = make_commit("merge123456789abcd", "Merge PR #42", true);
-        let detail = CommitDetail {
-            changed_paths: vec![],
-            diff: String::new(),
-        };
+        let detail = CommitDetail::from_diff(vec![], String::new());
         let harness = Harness::new_ui(|ui| {
             render_detail(ui, &commit, &detail);
         });
