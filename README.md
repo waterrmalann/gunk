@@ -1,2 +1,2 @@
-# gunk
+# gitscrub
 git history cleanup tool
