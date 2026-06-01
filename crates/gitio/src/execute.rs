@@ -681,19 +681,44 @@ fn run_flatten_in(
     // Get the new tip.
     let new_tip = git.run(["rev-parse", "HEAD"])?.stdout.trim().to_string();
 
-    // Build the rewrite map: the merge maps to M', and each old descendant
-    // (in rebase order) maps to its rewritten counterpart. `rev-list A..B`
-    // lists B's history excluding A's, newest-first; the old and new ranges
-    // are the same length because flatten's rebase drops no commits.
+    // Build a map from each old commit id to its new one. The merge maps to M';
+    // each descendant maps to its rebased copy. We get the descendants from two
+    // `rev-list` calls (old range and new range, both newest-first) and pair
+    // them up by position.
     let mut map = OidMap::new();
     map.insert(spec.merge.clone(), Some(CommitId(new_commit.clone())));
 
     let old_desc = git.run(["rev-list", &format!("{}..{}", spec.merge.0, branch_tip)])?;
-    let new_desc = git.run(["rev-list", &format!("{new_commit}..{new_tip}")])?;
     let old_ids: Vec<&str> = old_desc.stdout.lines().filter(|l| !l.is_empty()).collect();
+    let new_desc = git.run(["rev-list", &format!("{new_commit}..{new_tip}")])?;
     let new_ids: Vec<&str> = new_desc.stdout.lines().filter(|l| !l.is_empty()).collect();
-    for (old, new) in old_ids.iter().zip(new_ids.iter()) {
-        map.insert(CommitId(old.to_string()), Some(CommitId(new.to_string())));
+
+    // Pairing by position only works if the two lists line up one-to-one. They
+    // don't if the descendants contain another merge: rebase drops that merge
+    // and shuffles the surrounding commits, so the lists differ in length and
+    // order. (A descendant commit that rebases to nothing causes the same skew.)
+    //
+    // Guessing here would map operations onto the wrong commits. Instead, when
+    // we can't pair safely, record every descendant as dropped (`None`). A plain
+    // flatten never reads this map, so it still works. But a follow-up phase in
+    // a composite that tries to touch one of these commits gets a clean
+    // `CommitNotFound` error and rolls back — far better than a silent rewrite.
+    let descendant_merges = git.run([
+        "rev-list",
+        "--merges",
+        &format!("{}..{}", spec.merge.0, branch_tip),
+    ])?;
+    let pairing_reliable =
+        descendant_merges.stdout.trim().is_empty() && old_ids.len() == new_ids.len();
+
+    if pairing_reliable {
+        for (old, new) in old_ids.iter().zip(new_ids.iter()) {
+            map.insert(CommitId(old.to_string()), Some(CommitId(new.to_string())));
+        }
+    } else {
+        for old in &old_ids {
+            map.insert(CommitId(old.to_string()), None);
+        }
     }
 
     Ok((new_tip, map))
@@ -984,6 +1009,10 @@ fn execute_composite(
     // Original→current id map, accumulated across rewrite phases.
     let mut accumulated: OidMap = OidMap::new();
     let mut last_result: Option<ExecuteResult> = None;
+    // Collect "you rewrote a pushed commit" warnings from every phase. The
+    // final result only carries the last phase's, so gather them here or a
+    // warning from an earlier phase would be lost.
+    let mut pushed_commits: Vec<String> = Vec::new();
 
     for sub_plan in plans {
         // Retarget this phase's plan onto the history produced by prior phases.
@@ -1004,6 +1033,11 @@ fn execute_composite(
 
         match sub_result {
             Ok(result) => {
+                for c in &result.pushed_commits {
+                    if !pushed_commits.contains(c) {
+                        pushed_commits.push(c.clone());
+                    }
+                }
                 // Fold this phase's rewrite into the accumulated map so the next
                 // phase (still in original ids) resolves all the way through.
                 accumulated = compose_oid_maps(&accumulated, &result.oid_map);
@@ -1024,7 +1058,7 @@ fn execute_composite(
         backup_ref,
         new_tip: final_result.new_tip,
         branch: final_result.branch,
-        pushed_commits: final_result.pushed_commits,
+        pushed_commits,
         oid_map: accumulated,
     })
 }

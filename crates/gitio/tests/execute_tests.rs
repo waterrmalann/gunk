@@ -2129,3 +2129,82 @@ fn flatten_conflict_during_descendant_rebase_leaves_branch_untouched() {
         }
     }
 }
+
+// ── Flatten: composite remap is safe when descendants contain a merge ──
+//
+// Regression test. If a flattened merge has another merge above it, rebase
+// reorders the commits in between, so the flatten step can't reliably tell
+// which old commit became which new one. Rather than guess (and risk rewriting
+// the wrong commit in a later phase), the composite must fail and roll the
+// branch back untouched.
+#[test]
+fn composite_flatten_with_descendant_merge_fails_loudly_and_leaves_branch_untouched() {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "first", &[("a.txt", "a")]);
+    fixture.commit("c2", "second", &[("b.txt", "b")]);
+
+    // First feature branch -> the merge M that we will flatten.
+    fixture.checkout_new_branch("feature1");
+    fixture.commit("c3", "feature1 work", &[("c.txt", "c")]);
+    fixture.checkout("main");
+    fixture.merge("M", "feature1", "Merge feature1");
+
+    // A second feature branch merged *above* M, so M has a descendant merge.
+    fixture.checkout_new_branch("feature2");
+    fixture.commit("s1", "feature2 work", &[("e.txt", "e")]);
+    fixture.checkout("main");
+    fixture.commit("m1", "main work", &[("f.txt", "f")]);
+    fixture.merge("MERGE2", "feature2", "Merge feature2");
+    fixture.commit("top", "top commit", &[("g.txt", "g")]);
+
+    let original_tip = fixture.rev_parse("main");
+    let git = Git::open(fixture.path()).unwrap();
+    let commits = git.walk_commits("main").unwrap();
+
+    // The merge to flatten is the older one (M), not the intervening MERGE2.
+    let merge_m = commits
+        .iter()
+        .find(|c| c.is_merge() && c.summary == "Merge feature1")
+        .unwrap();
+    // A descendant of M that the rebase phase will try to reword.
+    let top = commits.iter().find(|c| c.summary == "top commit").unwrap();
+
+    // Composite plan: flatten M, then reword a descendant of M.
+    let ops = vec![
+        Operation::FlattenMerge {
+            merge: merge_m.id.clone(),
+        },
+        Operation::Reword {
+            target: top.id.clone(),
+            summary: "reworded top".to_string(),
+            body: String::new(),
+        },
+    ];
+    let exec_plan = plan(&commits, &ops).expect("plan should build a composite");
+    assert!(
+        matches!(exec_plan, ExecutionPlan::Composite(_)),
+        "expected a composite (flatten + rebase) plan"
+    );
+
+    let result = execute_plan(&git, "main", &exec_plan);
+
+    // The composite must refuse rather than silently rewrite the wrong commit.
+    assert!(
+        result.is_err(),
+        "composite flatten+reword over a descendant merge must fail, not silently corrupt"
+    );
+
+    // And the real branch must be restored to its original tip.
+    let current_tip = fixture.rev_parse("main");
+    assert_eq!(
+        current_tip, original_tip,
+        "branch must be rolled back to its original tip on failure"
+    );
+    // History is intact: both merges still present.
+    let restored = git.walk_commits("main").unwrap();
+    assert_eq!(
+        restored.iter().filter(|c| c.is_merge()).count(),
+        2,
+        "both merge commits should survive the rolled-back composite"
+    );
+}
