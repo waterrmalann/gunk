@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>gunk — Git History Cleanup Tool</title>
+  <meta name="description" content="Open-source desktop app to safely clean up Git history. Squash, flatten merges, reword, reorder, remove files — all with draft mode and undo.">
+  <link rel="stylesheet" href="style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧹</text></svg>">
+</head>
+<body>
+  <header>
+    <nav>
+      <span class="logo">gunk</span>
+      <a href="https://github.com/waterrmalann/gunk" target="_blank" rel="noopener">GitHub</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero">
+      <h1>Clean up your Git history.<br>Without fear.</h1>
+      <p class="tagline">
+        Squash commits. Flatten merges. Reword messages. Remove files from history. Reorder commits.
+        All in draft mode — nothing touches your repo until you confirm.
+      </p>
+      <div class="actions">
+        <a href="https://github.com/waterrmalann/gunk" class="btn primary">View on GitHub</a>
+        <a href="#features" class="btn secondary">See what it does</a>
+      </div>
+      <figure class="screenshot">
+        <img src="screenshot.png" alt="gunk desktop app showing a Git repository's commit history with draft edits, squash and flatten controls, and a safety-focused UI" loading="lazy">
+        <figcaption>The gunk desktop interface — select, edit, preview, confirm.</figcaption>
+      </figure>
+    </section>
+
+    <section id="features" class="features">
+      <h2>What gunk does</h2>
+      <div class="feature-grid">
+        <div class="feature">
+          <h3>⑂ Flatten merge commits</h3>
+          <p>Turn merge commits into ordinary commits so you can squash across them. The resulting tree is byte-identical to the original merge.</p>
+        </div>
+        <div class="feature">
+          <h3>⊟ Squash &amp; fixup</h3>
+          <p>Multi-select commits and squash them into one. Or fixup to discard the absorbed messages. Ctrl+click to select, then combine.</p>
+        </div>
+        <div class="feature">
+          <h3>✎ Rewrite messages &amp; authors</h3>
+          <p>Edit commit messages, descriptions, and author info. Bulk-apply across multiple selected commits at once.</p>
+        </div>
+        <div class="feature">
+          <h3>⤒ Reorder commits</h3>
+          <p>Drag commits into the order you wish they'd been made. Safe and reversible.</p>
+        </div>
+        <div class="feature">
+          <h3>✕ Remove files from history</h3>
+          <p>Strip sensitive or accidental files from the entire history. Optionally append them to <code>.gitignore</code>.</p>
+        </div>
+        <div class="feature">
+          <h3>⑂ Co-author management</h3>
+          <p>Add, edit, or remove <code>Co-authored-by</code> trailers. Bulk-apply across multiple commits.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="safety">
+      <h2>Built to never break your repo</h2>
+      <div class="safety-grid">
+        <div class="safety-item">
+          <h3>Draft mode</h3>
+          <p>All edits accumulate as a pending plan. Nothing touches your repo until you explicitly confirm. Review the projected history before it becomes permanent.</p>
+        </div>
+        <div class="safety-item">
+          <h3>Rehearsal</h3>
+          <p>Every mutation is rehearsed in a throwaway worktree first. If anything conflicts or fails, the real branch is untouched.</p>
+        </div>
+        <div class="safety-item">
+          <h3>Automatic backups</h3>
+          <p>A backup ref is created before every rewrite. One-click restore if you change your mind.</p>
+        </div>
+        <div class="safety-item">
+          <h3>Push warning</h3>
+          <p>If you're rewriting commits that have already been pushed, gunk warns you before applying.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="how">
+      <h2>How it works</h2>
+      <ol>
+        <li><strong>Open</strong> a Git repository and pick a branch.</li>
+        <li><strong>Select</strong> commits — click, Ctrl+click for multi-select, Shift for range, or search and bulk-select.</li>
+        <li><strong>Edit</strong> — squash, reword, flatten, reorder, remove files. All changes are drafts.</li>
+        <li><strong>Preview</strong> the projected history diff before applying.</li>
+        <li><strong>Confirm</strong> — gunk rehearses in a temporary worktree, creates a backup, then applies only if clean.</li>
+      </ol>
+    </section>
+
+    <section class="tech">
+      <h2>Under the hood</h2>
+      <ul>
+        <li><strong>No reimplemented Git.</strong> gunk shells out to your <code>git</code> binary for reads and writes. The CLI is the single source of truth.</li>
+        <li><strong>Pure core.</strong> All planning logic is pure, deterministic, and unit-tested. No IO, no side effects.</li>
+        <li><strong>Cross-platform.</strong> Native desktop app built with Rust + egui. Single binary, no runtime.</li>
+        <li><strong>Optional <code>git-filter-repo</code></strong> for file removal. Detected on startup; gracefully disabled if absent.</li>
+        <li><strong>Open source</strong> under MIT. Contributions welcome.</li>
+      </ul>
+    </section>
+
+    <section id="install" class="install">
+      <h2>Get started</h2>
+      <div class="install-card">
+        <div class="terminal">
+          <div class="terminal-header">
+            <span class="terminal-dot"></span>
+            <span class="terminal-dot"></span>
+            <span class="terminal-dot"></span>
+          </div>
+          <pre><code><span class="cmd-comment"># Clone and build</span>
+<span class="cmd-prompt">$</span> <span class="cmd-bin">git</span> <span class="cmd-flag">clone</span> <span class="cmd-url">https://github.com/waterrmalann/gunk.git</span>
+<span class="cmd-prompt">$</span> <span class="cmd-bin">cd</span> <span class="cmd-arg">gunk</span>
+<span class="cmd-prompt">$</span> <span class="cmd-bin">cargo</span> <span class="cmd-flag">build</span> <span class="cmd-flag">--release</span>
+
+<span class="cmd-comment"># Run</span>
+<span class="cmd-prompt">$</span> <span class="cmd-bin">./target/release/gunk-app</span></code></pre>
+        </div>
+        <p class="install-note">Requires Rust 1.85+ and Git. No config needed.</p>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p>
+      <span class="logo-sm">gunk</span> — MIT license.
+      <a href="https://github.com/waterrmalann/gunk">GitHub</a>
+    </p>
+  </footer>
+</body>
+</html>

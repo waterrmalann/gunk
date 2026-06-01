@@ -1,0 +1,416 @@
+/* gunk landing page — minimal, utilitarian */
+
+:root {
+  --bg: #0e0e10;
+  --surface: #18181b;
+  --surface-2: #232328;
+  --border: #2e2e35;
+  --text: #e4e4e7;
+  --text-dim: #a1a1aa;
+  --accent: #01fe70;
+  --accent-dim: #019e48;
+  --mono: "SF Mono", "Cascadia Code", "Fira Code", ui-monospace, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  --max-w: 720px;
+  --measure: 34rem;
+}
+
+*,
+*::before,
+*::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html {
+  font-size: 16px;
+  scroll-behavior: smooth;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  font-family: var(--sans);
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.6;
+  min-height: 100dvh;
+}
+
+/* ── Nav ── */
+
+header {
+  border-bottom: 1px solid var(--border);
+}
+
+nav {
+  max-width: var(--max-w);
+  margin: 0 auto;
+  padding: 0.75rem 1.5rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.logo {
+  font-family: var(--mono);
+  font-weight: 700;
+  font-size: 1.15rem;
+  color: var(--accent);
+  letter-spacing: -0.02em;
+}
+
+nav a {
+  color: var(--text-dim);
+  text-decoration: none;
+  font-size: 0.875rem;
+}
+
+nav a:hover {
+  color: var(--accent);
+}
+
+/* ── Screenshot ── */
+
+.screenshot {
+  margin-top: 2.25rem;
+  text-align: center;
+}
+
+.screenshot img {
+  width: 100%;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
+}
+
+.screenshot figcaption {
+  margin-top: 0.6rem;
+  font-size: 0.8rem;
+  color: var(--text-dim);
+}
+
+/* ── Main ── */
+
+main {
+  max-width: var(--max-w);
+  margin: 0 auto;
+  padding: 0 1.5rem;
+}
+
+section {
+  padding: 4rem 0;
+}
+
+section + section {
+  border-top: 1px solid var(--border);
+}
+
+h1, h2, h3 {
+  line-height: 1.2;
+  letter-spacing: -0.025em;
+}
+
+h1 {
+  font-size: clamp(1.75rem, 4vw, 2.5rem);
+  font-weight: 700;
+  max-width: var(--measure);
+}
+
+h2 {
+  font-size: 1.35rem;
+  font-weight: 650;
+  margin-bottom: 1.75rem;
+}
+
+h3 {
+  font-size: 1rem;
+  font-weight: 600;
+  margin-bottom: 0.4rem;
+}
+
+p, li {
+  color: var(--text-dim);
+  max-width: var(--measure);
+}
+
+p {
+  margin-top: 0.35rem;
+}
+
+code {
+  font-family: var(--mono);
+  font-size: 0.85em;
+  background: var(--surface-2);
+  padding: 0.15em 0.35em;
+  border-radius: 3px;
+}
+
+/* ── Hero ── */
+
+.hero {
+  padding: 5rem 0 4rem;
+  text-align: left;
+}
+
+.tagline {
+  font-size: 1.05rem;
+  margin-top: 1rem;
+  color: var(--text-dim);
+  line-height: 1.7;
+}
+
+.actions {
+  margin-top: 2rem;
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.btn {
+  display: inline-block;
+  padding: 0.55rem 1.15rem;
+  border-radius: 5px;
+  font-size: 0.875rem;
+  font-weight: 500;
+  text-decoration: none;
+  transition: background 0.15s, color 0.15s;
+  border: 1px solid var(--border);
+}
+
+.btn.primary {
+  background: var(--accent);
+  color: var(--bg);
+  border-color: var(--accent);
+}
+
+.btn.primary:hover {
+  background: #06b6d4;
+}
+
+.btn.secondary {
+  background: var(--surface);
+  color: var(--text);
+}
+
+.btn.secondary:hover {
+  background: var(--surface-2);
+  color: var(--accent);
+}
+
+/* ── Feature grid ── */
+
+.feature-grid, .safety-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 19rem), 1fr));
+  gap: 1.5rem;
+}
+
+.feature, .safety-item {
+  padding: 1.25rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.feature h3, .safety-item h3 {
+  color: var(--accent);
+}
+
+/* ── How it works ── */
+
+.how ol {
+  list-style: none;
+  counter-reset: steps;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.how ol li {
+  counter-increment: steps;
+  position: relative;
+  padding-left: 2.5rem;
+  min-height: 1.6rem;
+}
+
+.how ol li::before {
+  content: counter(steps);
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 1.5rem;
+  height: 1.5rem;
+  background: var(--accent-dim);
+  color: var(--bg);
+  font-size: 0.8rem;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+}
+
+.how ol li strong {
+  color: var(--text);
+}
+
+/* ── Tech ── */
+
+.tech ul {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+
+.tech ul li {
+  padding-left: 1rem;
+  position: relative;
+}
+
+.tech ul li::before {
+  content: "→";
+  position: absolute;
+  left: 0;
+  color: var(--accent-dim);
+}
+
+.tech ul li strong {
+  color: var(--text);
+}
+
+/* ── Install ── */
+
+.install-card {
+  padding: 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.terminal {
+  position: relative;
+}
+
+.terminal-header {
+  display: flex;
+  gap: 6px;
+  padding: 0.6rem 1rem;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+}
+
+.terminal-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--border);
+}
+
+.terminal pre {
+  background: var(--surface);
+  border: none;
+  margin: 0;
+  padding: 1rem 1.25rem;
+}
+
+.install-note {
+  padding: 0.6rem 1.25rem 0.85rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.8rem;
+  color: var(--text-dim);
+}
+
+/* ── Syntax highlighting ── */
+
+.cmd-comment {
+  color: #6b7280;
+  font-style: italic;
+}
+
+.cmd-prompt {
+  color: #01fe70;
+  font-weight: 700;
+}
+
+.cmd-bin {
+  color: #60a5fa;
+  font-weight: 600;
+}
+
+.cmd-flag {
+  color: #fbbf24;
+}
+
+.cmd-url {
+  color: #34d399;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.cmd-arg {
+  color: #c084fc;
+}
+
+pre {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.75rem 1rem;
+  overflow-x: auto;
+  margin-top: 0.5rem;
+}
+
+pre code {
+  background: none;
+  padding: 0;
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+
+/* ── Footer ── */
+
+footer {
+  max-width: var(--max-w);
+  margin: 0 auto;
+  padding: 2rem 1.5rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.8rem;
+  color: var(--text-dim);
+}
+
+footer a {
+  color: var(--text-dim);
+  text-decoration: none;
+  margin-left: 0.5rem;
+}
+
+footer a:hover {
+  color: var(--accent);
+}
+
+.logo-sm {
+  font-family: var(--mono);
+  font-weight: 700;
+  color: var(--accent);
+}
+
+/* ── Responsive ── */
+
+@media (max-width: 480px) {
+  .hero {
+    padding: 3rem 0 2.5rem;
+  }
+
+  section {
+    padding: 2.5rem 0;
+  }
+
+  .feature-grid, .safety-grid {
+    grid-template-columns: 1fr;
+  }
+}
