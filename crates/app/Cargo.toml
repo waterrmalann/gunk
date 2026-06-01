@@ -9,6 +9,7 @@ gunk-core = { path = "../core" }
 gunk-gitio = { path = "../gitio" }
 eframe = { workspace = true }
 egui = { workspace = true }
+egui-phosphor = { workspace = true }
 rfd = { workspace = true }
 time = { workspace = true }
 

@@ -8,6 +8,14 @@ edition = "2024"
 license = "MIT"
 rust-version = "1.85"
 
+# Size-optimized release builds (portable, lightweight binaries)
+[profile.release]
+opt-level = "s"   # optimize for size
+lto = true        # link-time optimization across crates
+codegen-units = 1 # better optimization at the cost of build time
+panic = "abort"   # drop unwinding tables
+strip = true      # strip symbols from the binary
+
 [workspace.dependencies]
 # Domain
 thiserror = "2"
@@ -17,6 +25,7 @@ time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
 # GUI
 eframe = "0.31"
 egui = "0.31"
+egui-phosphor = "0.9"
 rfd = "0.15"
 
 # Testing

@@ -1,9 +1,13 @@
+// Hide the console window on Windows release builds (portable GUI app).
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
 use eframe::egui;
+use egui_phosphor::regular as icon;
 use gunk_core::{
     ChangeStatus, CoAuthor, Commit, CommitId, DraftMsg, DraftState, Identity, PathChange, PathSpec,
     PreviewRow, RowStatus, SearchHit, SelectionMsg, SelectionState, parse_co_authors, plan,
@@ -27,7 +31,12 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "gunk",
         options,
-        Box::new(|_cc| Ok(Box::new(App::default()))),
+        Box::new(|cc| {
+            let mut fonts = egui::FontDefinitions::default();
+            egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+            cc.egui_ctx.set_fonts(fonts);
+            Ok(Box::new(App::default()))
+        }),
     )
 }
 
@@ -848,7 +857,7 @@ impl eframe::App for App {
 
             egui::TopBottomPanel::top("search_bar").show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("🔍");
+                    ui.label(icon::MAGNIFYING_GLASS);
                     let repo = self.repo.as_mut().unwrap();
                     let response = ui.add(
                         egui::TextEdit::singleline(&mut repo.search_query)
@@ -864,7 +873,10 @@ impl eframe::App for App {
                         {
                             select_all_results = true;
                         }
-                        if ui.button("Clear").clicked() {
+                        if ui
+                            .button(format!("{} Clear", icon::X))
+                            .clicked()
+                        {
                             repo.search_query.clear();
                             search_changed = true;
                         }
@@ -884,7 +896,7 @@ impl eframe::App for App {
         // Error banner
         if let Some(err) = &self.error {
             egui::TopBottomPanel::top("error_banner").show(ctx, |ui| {
-                ui.colored_label(egui::Color32::RED, format!("⚠ {err}"));
+                ui.colored_label(egui::Color32::RED, format!("{} {err}", icon::WARNING));
             });
         }
 
@@ -994,7 +1006,7 @@ impl eframe::App for App {
                                             ca.name, ca.email
                                         ));
                                         if ui
-                                            .small_button("Remove")
+                                            .small_button(icon::X)
                                             .on_hover_text(
                                                 "Remove this co-author",
                                             )
@@ -1124,17 +1136,32 @@ impl eframe::App for App {
                         ui.heading(format!("{sel_len} commits selected"));
                         ui.separator();
 
-                        if ui.button("🗑 Drop all").clicked() {
+                        if ui
+                            .button(format!("{} Drop all", icon::TRASH))
+                            .clicked()
+                        {
                             draft_msg = Some(DraftMsg::DropMany(targets.clone()));
                         }
                         ui.horizontal(|ui| {
-                            if ui.button("⬇ Squash into oldest").clicked() {
+                            if ui
+                                .button(format!(
+                                    "{} Squash into oldest",
+                                    icon::ARROW_DOWN
+                                ))
+                                .clicked()
+                            {
                                 draft_msg = Some(DraftMsg::Squash {
                                     keep: keep.clone(),
                                     absorb: absorb.clone(),
                                 });
                             }
-                            if ui.button("⬇ Fixup into oldest").clicked() {
+                            if ui
+                                .button(format!(
+                                    "{} Fixup into oldest",
+                                    icon::ARROW_DOWN
+                                ))
+                                .clicked()
+                            {
                                 draft_msg = Some(DraftMsg::Fixup {
                                     keep: keep.clone(),
                                     absorb: absorb.clone(),
@@ -1241,12 +1268,18 @@ impl eframe::App for App {
                             request_confirm = true;
                         }
                     }
-                    if ui.button("↻ Restore from backup").clicked() {
+                    if ui
+                        .button(format!(
+                            "{} Restore from backup",
+                            icon::ARROW_COUNTER_CLOCKWISE
+                        ))
+                        .clicked()
+                    {
                         request_restore_panel = true;
                     }
                     if let Some(err) = &repo.plan_error {
                         ui.separator();
-                        ui.colored_label(egui::Color32::RED, format!("⚠ invalid draft: {err}"));
+                        ui.colored_label(egui::Color32::RED, format!("{} invalid draft: {err}", icon::WARNING));
                     }
                 });
 
@@ -1266,7 +1299,8 @@ impl eframe::App for App {
                                 ui.colored_label(
                                     egui::Color32::from_rgb(255, 200, 50),
                                     format!(
-                                        "⚠ {} commit(s) were reachable from remote-tracking refs (published history rewritten)",
+                                        "{} {} commit(s) were reachable from remote-tracking refs (published history rewritten)",
+                                        icon::WARNING,
                                         r.pushed_commits.len()
                                     ),
                                 );
@@ -1294,7 +1328,7 @@ impl eframe::App for App {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui.label("⚠ This will rewrite the branch history. This cannot be undone automatically (but a backup ref will be created).");
+                    ui.label(format!("{} This will rewrite the branch history. This cannot be undone automatically (but a backup ref will be created).", icon::WARNING));
                     ui.add_space(8.0);
                     ui.label(format!("Branch: {branch}"));
                     ui.label(format!("Operations: {draft_count}"));
