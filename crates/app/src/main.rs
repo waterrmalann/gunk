@@ -864,7 +864,7 @@ impl eframe::App for App {
                         {
                             select_all_results = true;
                         }
-                        if ui.button("✕ Clear").clicked() {
+                        if ui.button("Clear").clicked() {
                             repo.search_query.clear();
                             search_changed = true;
                         }
@@ -993,7 +993,13 @@ impl eframe::App for App {
                                             "{} <{}>",
                                             ca.name, ca.email
                                         ));
-                                        if ui.small_button("✕").clicked() {
+                                        if ui
+                                            .small_button("Remove")
+                                            .on_hover_text(
+                                                "Remove this co-author",
+                                            )
+                                            .clicked()
+                                        {
                                             let mut updated =
                                                 existing_co_authors.clone();
                                             updated.remove(i);
