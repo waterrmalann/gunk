@@ -1,6 +1,6 @@
 use gunk_core::{
-    CommitId, ExecutionPlan, FilterRepoSpec, FlattenSpec, Identity, Operation, PathSpec,
-    RebaseTodo, RebaseTodoLine, plan,
+    CommitId, ExecutionPlan, FilterRepoSpec, FlattenSpec, FlattenStrategy, Identity, Operation,
+    PathSpec, RebaseTodo, RebaseTodoLine, plan,
 };
 use gunk_gitio::{
     Git, check_clean, create_backup_ref, execute_filter_repo, execute_flatten, execute_plan,
@@ -1724,6 +1724,7 @@ fn flatten_merge_at_tip() {
         merge: merge_commit.id.clone(),
         mainline_parent: merge_commit.parents[0].clone(),
         message: merge_commit.summary.clone(),
+        strategy: FlattenStrategy::default(),
     };
 
     let result = execute_flatten(&git, "main", &spec).unwrap();
@@ -1770,6 +1771,7 @@ fn flatten_merge_in_middle_rebases_descendants() {
         merge: merge_commit.id.clone(),
         mainline_parent: merge_commit.parents[0].clone(),
         message: merge_commit.summary.clone(),
+        strategy: FlattenStrategy::default(),
     };
 
     let result = execute_flatten(&git, "main", &spec).unwrap();
@@ -1816,6 +1818,7 @@ fn flatten_preserves_merge_tree_exactly() {
         merge: merge_commit.id.clone(),
         mainline_parent: merge_commit.parents[0].clone(),
         message: "Flattened merge".to_string(),
+        strategy: FlattenStrategy::default(),
     };
 
     execute_flatten(&git, "main", &spec).unwrap();
@@ -1865,6 +1868,7 @@ fn flatten_merge_with_resolved_conflicts() {
         merge: merge_commit.id.clone(),
         mainline_parent: merge_commit.parents[0].clone(),
         message: merge_commit.summary.clone(),
+        strategy: FlattenStrategy::default(),
     };
 
     execute_flatten(&git, "main", &spec).unwrap();
@@ -1893,6 +1897,7 @@ fn flatten_refuses_dirty_tree() {
         merge: merge_commit.id.clone(),
         mainline_parent: merge_commit.parents[0].clone(),
         message: merge_commit.summary.clone(),
+        strategy: FlattenStrategy::default(),
     };
 
     let err = execute_flatten(&git, "main", &spec).unwrap_err();
@@ -1912,6 +1917,7 @@ fn flatten_creates_backup_ref() {
         merge: merge_commit.id.clone(),
         mainline_parent: merge_commit.parents[0].clone(),
         message: merge_commit.summary.clone(),
+        strategy: FlattenStrategy::default(),
     };
 
     let result = execute_flatten(&git, "main", &spec).unwrap();
@@ -1935,6 +1941,7 @@ fn flatten_restore_from_backup() {
         merge: merge_commit.id.clone(),
         mainline_parent: merge_commit.parents[0].clone(),
         message: merge_commit.summary.clone(),
+        strategy: FlattenStrategy::default(),
     };
 
     let result = execute_flatten(&git, "main", &spec).unwrap();
@@ -1974,6 +1981,7 @@ fn flatten_ff_style_merge() {
         merge: merge_commit.id.clone(),
         mainline_parent: merge_commit.parents[0].clone(),
         message: merge_commit.summary.clone(),
+        strategy: FlattenStrategy::default(),
     };
 
     execute_flatten(&git, "main", &spec).unwrap();
@@ -1999,6 +2007,7 @@ fn execute_plan_handles_flatten() {
 
     let operations = vec![Operation::FlattenMerge {
         merge: merge_commit.id.clone(),
+        strategy: FlattenStrategy::default(),
     }];
     let exec_plan = plan(&commits, &operations).unwrap();
 
@@ -2033,6 +2042,7 @@ fn flatten_then_squash_composite() {
         merge: merge_commit.id.clone(),
         mainline_parent: merge_commit.parents[0].clone(),
         message: merge_commit.summary.clone(),
+        strategy: FlattenStrategy::default(),
     };
     execute_flatten(&git, "main", &flatten_spec).unwrap();
 
@@ -2083,6 +2093,7 @@ fn flatten_preserves_custom_message() {
         merge: merge_commit.id.clone(),
         mainline_parent: merge_commit.parents[0].clone(),
         message: "Flattened: feature branch".to_string(),
+        strategy: FlattenStrategy::default(),
     };
 
     execute_flatten(&git, "main", &spec).unwrap();
@@ -2136,6 +2147,7 @@ fn flatten_conflict_during_descendant_rebase_leaves_branch_untouched() {
         merge: merge_commit.id.clone(),
         mainline_parent: merge_commit.parents[0].clone(),
         message: merge_commit.summary.clone(),
+        strategy: FlattenStrategy::default(),
     };
 
     // This may succeed (no conflict because tree is identical) or fail.
@@ -2204,6 +2216,7 @@ fn composite_flatten_with_descendant_merge_fails_loudly_and_leaves_branch_untouc
     let ops = vec![
         Operation::FlattenMerge {
             merge: merge_m.id.clone(),
+            strategy: FlattenStrategy::default(),
         },
         Operation::Reword {
             target: top.id.clone(),
@@ -2238,4 +2251,126 @@ fn composite_flatten_with_descendant_merge_fails_loudly_and_leaves_branch_untouc
         2,
         "both merge commits should survive the rolled-back composite"
     );
+}
+
+// Shared fixture for the descendant-merge strategy tests: an older merge M with
+// an unrelated, newer merge MERGE2 sitting above it.
+//
+//   c1 - c2 - M --------- m1 - MERGE2 - top   (main)
+//             |                  |
+//             c3 (feature1)      s1 (feature2)
+//
+// Returns (fixture, git, original_tip, id of merge M).
+fn fixture_with_stacked_merges() -> (RepoFixture, Git, String, CommitId) {
+    let mut fixture = RepoFixture::new();
+    fixture.commit("c1", "first", &[("a.txt", "a")]);
+    fixture.commit("c2", "second", &[("b.txt", "b")]);
+
+    // The merge M we intend to flatten.
+    fixture.checkout_new_branch("feature1");
+    fixture.commit("c3", "feature1 work", &[("c.txt", "c")]);
+    fixture.checkout("main");
+    fixture.merge("M", "feature1", "Merge feature1");
+
+    // A second, unrelated merge MERGE2 sitting *above* M.
+    fixture.checkout_new_branch("feature2");
+    fixture.commit("s1", "feature2 work", &[("e.txt", "e")]);
+    fixture.checkout("main");
+    fixture.commit("m1", "main work", &[("f.txt", "f")]);
+    fixture.merge("MERGE2", "feature2", "Merge feature2");
+    fixture.commit("top", "top commit", &[("g.txt", "g")]);
+
+    let original_tip = fixture.rev_parse("main");
+    let git = Git::open(fixture.path()).unwrap();
+    let commits = git.walk_commits("main").unwrap();
+    let merge_m = commits
+        .iter()
+        .find(|c| c.is_merge() && c.summary == "Merge feature1")
+        .unwrap()
+        .clone();
+
+    (fixture, git, original_tip, merge_m.id)
+}
+
+// ── Flatten: PreserveDescendantMerges keeps an unrelated descendant merge ──
+//
+// The default strategy must flatten only the merge the user selected. A newer,
+// unrelated merge sitting above it is replayed via `git rebase --rebase-merges`
+// and therefore survives — we never silently linearize topology the user did
+// not ask to touch (see ADR-0021).
+#[test]
+fn standalone_flatten_preserve_keeps_descendant_merge() {
+    let (fixture, git, original_tip, merge_m_id) = fixture_with_stacked_merges();
+    let merge_m = git
+        .walk_commits("main")
+        .unwrap()
+        .into_iter()
+        .find(|c| c.id == merge_m_id)
+        .unwrap();
+
+    let spec = FlattenSpec {
+        merge: merge_m.id.clone(),
+        mainline_parent: merge_m.parents[0].clone(),
+        message: merge_m.summary.clone(),
+        strategy: FlattenStrategy::PreserveDescendantMerges,
+    };
+
+    execute_flatten(&git, "main", &spec).expect("preserve flatten should succeed");
+
+    // The branch moved (M was flattened).
+    assert_ne!(fixture.rev_parse("main"), original_tip);
+
+    // Exactly one merge remains: MERGE2 survived, M became ordinary.
+    let after = git.walk_commits("main").unwrap();
+    assert_eq!(
+        after.iter().filter(|c| c.is_merge()).count(),
+        1,
+        "only the selected merge should be flattened; MERGE2 must survive"
+    );
+    assert!(
+        after.iter().any(|c| c.summary == "Merge feature2"),
+        "the unrelated descendant merge must be preserved"
+    );
+    assert!(
+        !after
+            .iter()
+            .any(|c| c.is_merge() && c.summary == "Merge feature1"),
+        "the selected merge must be flattened away"
+    );
+}
+
+// ── Flatten: Linearize is the explicit power-user opt-in to drop merges ──
+//
+// When the caller deliberately chooses `Linearize`, the whole range is
+// flattened with a plain rebase, so the descendant merge is collapsed too. This
+// is the behavior the UI gates behind a warning/confirm.
+#[test]
+fn standalone_flatten_linearize_drops_descendant_merge() {
+    let (fixture, git, original_tip, merge_m_id) = fixture_with_stacked_merges();
+    let merge_m = git
+        .walk_commits("main")
+        .unwrap()
+        .into_iter()
+        .find(|c| c.id == merge_m_id)
+        .unwrap();
+
+    let spec = FlattenSpec {
+        merge: merge_m.id.clone(),
+        mainline_parent: merge_m.parents[0].clone(),
+        message: merge_m.summary.clone(),
+        strategy: FlattenStrategy::Linearize,
+    };
+
+    execute_flatten(&git, "main", &spec).expect("linearize flatten should succeed");
+
+    assert_ne!(fixture.rev_parse("main"), original_tip);
+
+    // Linearize collapses every merge in the range.
+    let after = git.walk_commits("main").unwrap();
+    for c in &after {
+        assert!(
+            c.parents.len() <= 1,
+            "linearize must leave a linear history"
+        );
+    }
 }

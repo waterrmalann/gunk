@@ -16,7 +16,7 @@ pub(super) fn collect_commit_ids(op: &Operation) -> Vec<&CommitId> {
         Operation::Drop { target } => vec![target],
         Operation::Reorder { new_order } => new_order.iter().collect(),
         Operation::RemovePaths { .. } => vec![],
-        Operation::FlattenMerge { merge } => vec![merge],
+        Operation::FlattenMerge { merge, .. } => vec![merge],
         Operation::SetCoAuthors { targets, .. } => targets.iter().collect(),
     }
 }
@@ -42,7 +42,7 @@ pub(super) fn validate_operations(
 ) -> Result<(), PlanError> {
     for op in operations {
         match op {
-            Operation::FlattenMerge { merge } => {
+            Operation::FlattenMerge { merge, .. } => {
                 let commit = &snapshot[commit_index[merge]];
                 if commit.parents.len() < 2 {
                     return Err(PlanError::NotAMergeCommit(merge.clone()));

@@ -12,7 +12,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gunk_core::{
-    CommitId, FilterRepoSpec, FlattenSpec, OidMap, RebaseTodo, RebaseTodoLine, compose_oid_maps,
+    CommitId, FilterRepoSpec, FlattenSpec, FlattenStrategy, OidMap, RebaseTodo, RebaseTodoLine,
+    compose_oid_maps,
 };
 use thiserror::Error;
 
@@ -674,11 +675,34 @@ fn run_flatten_in(
         return Ok((new_commit, map));
     }
 
+    // Does the range we're about to replay contain another merge commit the
+    // user never selected? If so, the replay strategy matters.
+    //
+    // A plain `git rebase --onto` silently DROPS every merge in its range and
+    // linearizes the surrounding commits — flattening the one merge the user
+    // picked would also destroy any *unrelated* descendant merge. To avoid that
+    // silent rewrite we default to `--rebase-merges`, which recreates the
+    // unselected merges (and fails loudly on a re-merge conflict rather than
+    // diverging). A power user who genuinely wants the whole range linearized
+    // can opt into [`FlattenStrategy::Linearize`]; the UI warns first.
+    let descendant_merges = git.run([
+        "rev-list",
+        "--merges",
+        &format!("{}..{}", spec.merge.0, branch_tip),
+    ])?;
+    let has_descendant_merges = !descendant_merges.stdout.trim().is_empty();
+
     // Rebase everything after the merge onto M'.
     // Use HEAD (detached) rather than the branch name, since the branch
     // is checked out in the original worktree.
+    let mut rebase_args = vec!["rebase"];
+    if matches!(spec.strategy, FlattenStrategy::PreserveDescendantMerges) {
+        rebase_args.push("--rebase-merges");
+    }
+    rebase_args.extend(["--onto", &new_commit, &spec.merge.0, "HEAD"]);
+
     let result = std::process::Command::new(git.git_binary())
-        .args(["rebase", "--onto", &new_commit, &spec.merge.0, "HEAD"])
+        .args(&rebase_args)
         .current_dir(git.repo_path())
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("LC_ALL", "C")
@@ -717,23 +741,23 @@ fn run_flatten_in(
     let new_desc = git.run(["rev-list", &format!("{new_commit}..{new_tip}")])?;
     let new_ids: Vec<&str> = new_desc.stdout.lines().filter(|l| !l.is_empty()).collect();
 
-    // Pairing by position only works if the two lists line up one-to-one. They
-    // don't if the descendants contain another merge: rebase drops that merge
-    // and shuffles the surrounding commits, so the lists differ in length and
-    // order. (A descendant commit that rebases to nothing causes the same skew.)
+    // Pairing by position only works if the two lists line up one-to-one. Two
+    // things break that:
     //
-    // Guessing here would map operations onto the wrong commits. Instead, when
-    // we can't pair safely, record every descendant as dropped (`None`). A plain
-    // flatten never reads this map, so it still works. But a follow-up phase in
-    // a composite that tries to touch one of these commits gets a clean
-    // `CommitNotFound` error and rolls back — far better than a silent rewrite.
-    let descendant_merges = git.run([
-        "rev-list",
-        "--merges",
-        &format!("{}..{}", spec.merge.0, branch_tip),
-    ])?;
-    let pairing_reliable =
-        descendant_merges.stdout.trim().is_empty() && old_ids.len() == new_ids.len();
+    // 1. A descendant commit that rebases to nothing (becomes empty) is
+    //    silently dropped — a length mismatch.
+    // 2. The range contained another merge. Whether we preserved it
+    //    (`--rebase-merges` rebuilds the topology, reordering the linear view)
+    //    or linearized it (the merge's second-parent commits collapse in), the
+    //    old and new lists no longer correspond position-for-position.
+    //
+    // Guessing across either case would map operations onto the wrong commits.
+    // When we can't pair safely, record every descendant as dropped (`None`). A
+    // standalone flatten never reads this map, so it still works. But a
+    // follow-up phase in a composite that tries to touch one of these commits
+    // gets a clean `CommitNotFound` error and rolls back — far better than a
+    // silent rewrite.
+    let pairing_reliable = old_ids.len() == new_ids.len() && !has_descendant_merges;
 
     if pairing_reliable {
         for (old, new) in old_ids.iter().zip(new_ids.iter()) {

@@ -1,5 +1,5 @@
 use crate::model::{CoAuthor, CommitId, Identity, PathSpec};
-use crate::operation::Operation;
+use crate::operation::{FlattenStrategy, Operation};
 
 /// The pending set of draft operations the user has accumulated.
 ///
@@ -57,7 +57,11 @@ pub enum DraftMsg {
         add_to_gitignore: bool,
     },
     /// Toggle flatten for a merge commit (add if absent, remove if present).
+    /// Added with the safe default strategy ([`FlattenStrategy::PreserveDescendantMerges`]).
     ToggleFlatten(CommitId),
+    /// Set the flatten strategy for an already-flattened merge. No-op if the
+    /// merge is not currently flattened.
+    SetFlattenStrategy(CommitId, FlattenStrategy),
     /// Set co-authors on one or more commits. Replaces any existing co-author
     /// op covering the exact same target set.
     SetCoAuthors {
@@ -179,13 +183,23 @@ impl DraftState {
             }
             DraftMsg::ToggleFlatten(merge) => {
                 let existing = ops.iter().position(
-                    |op| matches!(op, Operation::FlattenMerge { merge: m } if *m == merge),
+                    |op| matches!(op, Operation::FlattenMerge { merge: m, .. } if *m == merge),
                 );
                 match existing {
                     Some(idx) => {
                         ops.remove(idx);
                     }
-                    None => ops.push(Operation::FlattenMerge { merge }),
+                    None => ops.push(Operation::FlattenMerge {
+                        merge,
+                        strategy: FlattenStrategy::default(),
+                    }),
+                }
+            }
+            DraftMsg::SetFlattenStrategy(merge, strategy) => {
+                if let Some(op) = ops.iter_mut().find(
+                    |op| matches!(op, Operation::FlattenMerge { merge: m, .. } if *m == merge),
+                ) {
+                    *op = Operation::FlattenMerge { merge, strategy };
                 }
             }
             DraftMsg::SetCoAuthors {
@@ -419,7 +433,46 @@ mod tests {
             .reduce(DraftMsg::ToggleFlatten(cid("M2")))
             .reduce(DraftMsg::ToggleFlatten(cid("M1")));
         assert_eq!(d.len(), 1);
-        assert!(matches!(&d.ops[0], Operation::FlattenMerge { merge } if *merge == cid("M2")));
+        assert!(matches!(&d.ops[0], Operation::FlattenMerge { merge, .. } if *merge == cid("M2")));
+    }
+
+    #[test]
+    fn toggle_flatten_defaults_to_preserve_strategy() {
+        let d = DraftState::new().reduce(DraftMsg::ToggleFlatten(cid("M")));
+        assert!(matches!(
+            &d.ops[0],
+            Operation::FlattenMerge {
+                strategy: FlattenStrategy::PreserveDescendantMerges,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn set_flatten_strategy_updates_in_place() {
+        let d = DraftState::new()
+            .reduce(DraftMsg::ToggleFlatten(cid("M")))
+            .reduce(DraftMsg::SetFlattenStrategy(
+                cid("M"),
+                FlattenStrategy::Linearize,
+            ));
+        assert_eq!(d.len(), 1);
+        assert!(matches!(
+            &d.ops[0],
+            Operation::FlattenMerge {
+                merge,
+                strategy: FlattenStrategy::Linearize,
+            } if *merge == cid("M")
+        ));
+    }
+
+    #[test]
+    fn set_flatten_strategy_is_noop_when_not_flattened() {
+        let d = DraftState::new().reduce(DraftMsg::SetFlattenStrategy(
+            cid("M"),
+            FlattenStrategy::Linearize,
+        ));
+        assert!(d.is_empty());
     }
 
     #[test]

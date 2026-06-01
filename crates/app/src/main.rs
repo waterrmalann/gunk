@@ -942,10 +942,17 @@ impl eframe::App for App {
 
                             // Flatten button — only shown for merge commits.
                             if repo.commits[idx].is_merge() {
-                                let is_flattened = repo.draft.ops.iter().any(|op| {
-                                    matches!(op, gunk_core::Operation::FlattenMerge { merge } if *merge == id)
+                                let flatten_strategy = repo.draft.ops.iter().find_map(|op| {
+                                    match op {
+                                        gunk_core::Operation::FlattenMerge { merge, strategy }
+                                            if *merge == id =>
+                                        {
+                                            Some(*strategy)
+                                        }
+                                        _ => None,
+                                    }
                                 });
-                                let flatten_label = if is_flattened {
+                                let flatten_label = if flatten_strategy.is_some() {
                                     "↺ Unflatten"
                                 } else {
                                     "⑂ Flatten merge"
@@ -955,6 +962,51 @@ impl eframe::App for App {
                                 }
                             }
                         });
+
+                        // Descendant-merge strategy — only relevant once the
+                        // merge is flattened. Default preserves any unrelated
+                        // descendant merges; Linearize is the power-user opt-in
+                        // that collapses them, so it carries a warning.
+                        if repo.commits[idx].is_merge() {
+                            if let Some(current) = repo.draft.ops.iter().find_map(|op| match op {
+                                gunk_core::Operation::FlattenMerge { merge, strategy }
+                                    if *merge == id =>
+                                {
+                                    Some(*strategy)
+                                }
+                                _ => None,
+                            }) {
+                                ui.indent("flatten_strategy", |ui| {
+                                    ui.label("If a newer merge sits above this one:");
+                                    let preserve = gunk_core::FlattenStrategy::PreserveDescendantMerges;
+                                    let linearize = gunk_core::FlattenStrategy::Linearize;
+                                    if ui
+                                        .radio(current == preserve, "Preserve it (recommended)")
+                                        .clicked()
+                                        && current != preserve
+                                    {
+                                        draft_msg =
+                                            Some(DraftMsg::SetFlattenStrategy(id.clone(), preserve));
+                                    }
+                                    if ui
+                                        .radio(current == linearize, "Linearize everything")
+                                        .clicked()
+                                        && current != linearize
+                                    {
+                                        draft_msg = Some(DraftMsg::SetFlattenStrategy(
+                                            id.clone(),
+                                            linearize,
+                                        ));
+                                    }
+                                    if current == linearize {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(220, 160, 60),
+                                            "⚠ Drops every merge above this one, not just this one.",
+                                        );
+                                    }
+                                });
+                            }
+                        }
                         ui.collapsing("Reword", |ui| {
                             ui.label("Summary");
                             ui.text_edit_singleline(&mut repo.reword_summary);

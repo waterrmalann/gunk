@@ -80,7 +80,10 @@ fn unknown_commit_id_returns_error() {
 #[test]
 fn flatten_non_merge_returns_error() {
     let snap = linear_snapshot();
-    let ops = vec![Operation::FlattenMerge { merge: cid("C") }];
+    let ops = vec![Operation::FlattenMerge {
+        merge: cid("C"),
+        strategy: FlattenStrategy::default(),
+    }];
     let err = plan(&snap, &ops).unwrap_err();
     assert_eq!(err, PlanError::NotAMergeCommit(cid("C")));
 }
@@ -89,7 +92,10 @@ fn flatten_non_merge_returns_error() {
 fn octopus_merge_returns_error() {
     let mut snap = linear_snapshot();
     snap[2].parents = vec![cid("B"), cid("X"), cid("Y")]; // 3 parents
-    let ops = vec![Operation::FlattenMerge { merge: cid("C") }];
+    let ops = vec![Operation::FlattenMerge {
+        merge: cid("C"),
+        strategy: FlattenStrategy::default(),
+    }];
     let err = plan(&snap, &ops).unwrap_err();
     assert_eq!(err, PlanError::OctopusMergeUnsupported(cid("C")));
 }
@@ -432,7 +438,10 @@ fn remove_paths_with_empty_set_is_rejected() {
 #[test]
 fn flatten_merge() {
     let snap = snapshot_with_merge();
-    let ops = vec![Operation::FlattenMerge { merge: cid("M") }];
+    let ops = vec![Operation::FlattenMerge {
+        merge: cid("M"),
+        strategy: FlattenStrategy::default(),
+    }];
     let result = plan(&snap, &ops).unwrap();
     insta::assert_yaml_snapshot!(result);
 }
@@ -496,7 +505,10 @@ fn squash_with_author_change_on_keep() {
 fn flatten_plus_rebase_composite() {
     let snap = snapshot_with_merge();
     let ops = vec![
-        Operation::FlattenMerge { merge: cid("M") },
+        Operation::FlattenMerge {
+            merge: cid("M"),
+            strategy: FlattenStrategy::default(),
+        },
         Operation::Reword {
             target: cid("C"),
             summary: "Updated C".into(),
@@ -529,7 +541,10 @@ fn filter_repo_plus_rebase_composite() {
 fn all_three_plan_types_composite() {
     let snap = snapshot_with_merge();
     let ops = vec![
-        Operation::FlattenMerge { merge: cid("M") },
+        Operation::FlattenMerge {
+            merge: cid("M"),
+            strategy: FlattenStrategy::default(),
+        },
         Operation::RemovePaths {
             paths: vec![PathSpec("build/".into())],
             add_to_gitignore: true,
@@ -1082,6 +1097,7 @@ fn remap_leaves_unmapped_ids_unchanged() {
         merge: cid("a"),
         mainline_parent: cid("b"),
         message: "m".into(),
+        strategy: FlattenStrategy::default(),
     });
     let ExecutionPlan::Flatten(spec) = plan.remap_oids(&map).unwrap() else {
         panic!("expected Flatten");

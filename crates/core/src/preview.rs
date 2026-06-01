@@ -102,7 +102,7 @@ pub fn preview(
             Operation::Drop { target } => {
                 dropped.insert(target);
             }
-            Operation::FlattenMerge { merge } => {
+            Operation::FlattenMerge { merge, .. } => {
                 flattened.insert(merge);
             }
             Operation::Reorder { new_order } => {

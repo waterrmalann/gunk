@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::model::{Commit, CommitId, Identity, PathSpec};
-use crate::operation::Operation;
+use crate::operation::{FlattenStrategy, Operation};
 
 mod rebase;
 mod validate;
@@ -50,6 +50,8 @@ pub struct FlattenSpec {
     pub merge: CommitId,
     pub mainline_parent: CommitId,
     pub message: String,
+    /// How to replay descendant merges. See [`FlattenStrategy`].
+    pub strategy: FlattenStrategy,
 }
 
 /// The output of the plan engine. Deterministic and snapshot-testable.
@@ -120,6 +122,7 @@ impl ExecutionPlan {
                 merge: remap_required(&spec.merge, map)?,
                 mainline_parent: remap_required(&spec.mainline_parent, map)?,
                 message: spec.message.clone(),
+                strategy: spec.strategy,
             }),
             ExecutionPlan::Rebase(todo) => ExecutionPlan::Rebase(remap_rebase_todo(todo, map)?),
             ExecutionPlan::Composite(plans) => ExecutionPlan::Composite(
@@ -265,12 +268,13 @@ pub fn plan(snapshot: &[Commit], operations: &[Operation]) -> Result<ExecutionPl
 
     // 1. Flatten (must precede rebase).
     for op in &flatten_ops {
-        if let Operation::FlattenMerge { merge } = op {
+        if let Operation::FlattenMerge { merge, strategy } = op {
             let commit = &snapshot[commit_index[merge]];
             plans.push(ExecutionPlan::Flatten(FlattenSpec {
                 merge: merge.clone(),
                 mainline_parent: commit.parents[0].clone(),
                 message: format_message(&commit.summary, &commit.body),
+                strategy: *strategy,
             }));
         }
     }
