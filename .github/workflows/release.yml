@@ -1,0 +1,127 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v0.1.0)"
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: gunk-app
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build (windows-x86_64)
+    runs-on: windows-latest
+    env:
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-release-
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ env.TARGET }} -p ${{ env.BIN_NAME }}
+
+      - name: Package (Windows portable exe)
+        shell: pwsh
+        run: |
+          $src = "target/${{ env.TARGET }}/release/${{ env.BIN_NAME }}.exe"
+          Copy-Item $src "gunk-windows-x86_64.exe"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gunk-windows-x86_64
+          path: gunk-windows-x86_64.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  build-linux:
+    name: Build (linux-x86_64)
+    runs-on: ubuntu-latest
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-release-
+
+      - name: Install Linux GUI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ env.TARGET }} -p ${{ env.BIN_NAME }}
+
+      - name: Package (Linux tarball)
+        run: |
+          cp "target/${{ env.TARGET }}/release/${{ env.BIN_NAME }}" gunk
+          tar czf "gunk-linux-x86_64.tar.gz" gunk
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gunk-linux-x86_64
+          path: gunk-linux-x86_64.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          draft: false
+          generate_release_notes: true
+          files: |
+            artifacts/gunk-*.exe
+            artifacts/gunk-*.tar.gz
