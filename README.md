@@ -26,6 +26,10 @@ Every mutating apply follows a strict protocol:
 4. **Push warning** — If you're rewriting commits that have already been pushed, gunk warns you before applying.
 5. **Dirty-tree refusal** — Refuses to operate on a dirty working tree. Offers to auto-stash with explicit consent.
 
+## Word of warning
+
+While I've done my best to make the automated tests exhaustive, and the tool works well enough for my own use cases (which is what I built it for), there may still be undefined behaviour or bugs. Rewriting Git history is inherently dangerous — especially with a tool built in someone's spare time to scratch a personal itch. Only use gunk if you know what you're doing and have backups. Always verify the results before you force-push changes made with gunk. Don't be an idiot.
+
 ## Architecture
 
 ```
